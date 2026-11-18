@@ -22,7 +22,7 @@ import { DEFAULT_SETTINGS, LanSyncSettingTab, type LanSyncSettings } from "./set
 import { buildManifest } from "./core/manifest";
 import { planSync, summarizePlan, type SyncPlan, type ConflictItem, type ChangeItem } from "./core/plan";
 import { emptyBaseline, type Baseline, type FileEntry } from "./core/types";
-import { applyPullPlan, applyPushPlan } from "./core/engine";
+import { applyPullPlan, applyPushPlan, applyConflictChoice } from "./core/engine";
 import { HttpRemote } from "./net/remote";
 import type { IgnoreConfig } from "./core/ignore";
 
@@ -344,6 +344,7 @@ export default class LanSyncPlugin extends Plugin {
       const plan = planSync(local.entries, remoteManifest.entries, baseline, {
         mode: this.settings.syncMode,
         maxDeletes: this.settings.maxDeletes,
+        noBaseStrategy: this.settings.firstSyncStrategy,
       });
       notice.hide();
 
@@ -496,46 +497,16 @@ export default class LanSyncPlugin extends Plugin {
       await remote.startSession();
       sessionStarted = true;
       const baseline = await this.loadBaseline();
-    const remoteItem: ChangeItem = {
-      path: conflict.path,
-      size: conflict.remoteSize,
-      sha256: conflict.remoteSha,
-      mtime: 0,
-    };
-    const localItem: ChangeItem = {
-      path: conflict.path,
-      size: conflict.localSize,
-      sha256: conflict.localSha,
-      mtime: 0,
-    };
-
-    if (choice === "remote") {
-      const result = await applyPullPlan(adapter, remote, singlePlan({ downloads: [remoteItem] }), baseline, {
-        tmpDir: this.tempDir(),
-        remoteEntries: [],
-      });
-      if (result.errors.length) throw new Error(result.errors[0].message);
-      await this.saveBaseline(result.newBaseline);
-    } else if (choice === "local") {
-      const result = await applyPushPlan(adapter, remote, singlePlan({ uploads: [localItem] }), baseline, {
+      const result = await applyConflictChoice(adapter, remote, remote, conflict, choice, baseline, {
         chunkBytes,
-        remoteEntries: [],
-      });
-      if (result.errors.length) throw new Error(result.errors[0].message);
-      await this.saveBaseline(result.newBaseline);
-    } else {
-      // 保留两份：先把本机版本复制成冲突副本，再用电脑版本覆盖原文件。
-      const data = await adapter.readBinary(conflict.path);
-      const copyPath = conflictCopyPath(conflict.path);
-      await adapter.writeBinary(copyPath, data);
-      const result = await applyPullPlan(adapter, remote, singlePlan({ downloads: [remoteItem] }), baseline, {
         tmpDir: this.tempDir(),
-        remoteEntries: [],
+        makeCopyPath: conflictCopyPath,
       });
-      if (result.errors.length) throw new Error(result.errors[0].message);
+      if (result.errors.length) throw new Error(result.errors.join("；"));
       await this.saveBaseline(result.newBaseline);
-    }
-    this.log(`解决冲突：${conflict.path} → ${choice}`);
+      this.log(
+        `解决冲突：${conflict.path} → ${choice}${result.copyPath ? `（副本 ${result.copyPath}）` : ""}`
+      );
     } finally {
       if (sessionStarted) await remote.endSession();
       this.applying = false;

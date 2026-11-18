@@ -4,10 +4,12 @@
  */
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { createSyncServer, buildManifest, planSync, applyPullPlan, applyPushPlan, emptyBaseline } = (() => {
+const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
+const { createSyncServer, buildManifest, planSync, applyPullPlan, applyPushPlan, applyConflictChoice, emptyBaseline } = (() => {
   const server = require("../dist/server.cjs");
   const core = require("../dist/core.cjs");
   return { ...server, ...core };
@@ -517,3 +519,117 @@ test("端到端：本机把文件重命名（删除+新增）能正确传播到�
     await handle.close();
   }
 });
+
+test("端到端：电脑端清单突然为空 → 熔断，一个本机文件都不删", async () => {
+  const remoteRoot = makeTempDir("lan-remote10-");
+  const localRoot = makeTempDir("lan-local10-");
+  for (let i = 0; i < 5; i++) writeFile(remoteRoot, `n${i}.md`, `content ${i}`, 1700000000);
+
+  const handle = await createSyncServer({
+    port: 39309,
+    token: TOKEN,
+    uploadDir: path.join(remoteRoot, ".tmp-upload"),
+    vaultDir: remoteRoot,
+    ignore: IGNORE,
+    log: () => {},
+  });
+
+  try {
+    const base = `http://127.0.0.1:${handle.port}`;
+    await pullOnce(base, localRoot);
+    assert.equal(fs.readdirSync(localRoot).filter((f) => f.endsWith(".md")).length, 5);
+
+    for (let i = 0; i < 5; i++) fs.rmSync(path.join(remoteRoot, `n${i}.md`));
+    const { plan, result } = await pullOnce(base, localRoot);
+    assert.ok(plan.breaker, "电脑端清空应触发熔断");
+    assert.equal(result.appliedDeletes.length, 0);
+    assert.equal(fs.readdirSync(localRoot).filter((f) => f.endsWith(".md")).length, 5);
+  } finally {
+    await handle.close();
+  }
+});
+
+test("冲突三选一：留电脑 / 留手机 / 两份都留", async () => {
+  const remoteRoot = makeTempDir("lan-remote11-");
+  const localRoot = makeTempDir("lan-local11-");
+
+  const handle = await createSyncServer({
+    port: 39310,
+    token: TOKEN,
+    uploadDir: path.join(remoteRoot, ".tmp-upload"),
+    vaultDir: remoteRoot,
+    ignore: IGNORE,
+    log: () => {},
+  });
+  const base = `http://127.0.0.1:${handle.port}`;
+
+  const sha = (text) => sha256(Buffer.from(text));
+  const mkConflict = (filePath, localContent, remoteContent) => ({
+    path: filePath,
+    reason: "both-modified",
+    localSha: sha(localContent),
+    remoteSha: sha(remoteContent),
+    localSize: Buffer.byteLength(localContent),
+    remoteSize: Buffer.byteLength(remoteContent),
+  });
+
+  async function runChoice(conflict, choice, makeCopyPath = (p) => `copy-${p}`) {
+    return withSession(base, async (sessionId) => {
+      const adapter = createNodeAdapter(localRoot);
+      return applyConflictChoice(
+        adapter,
+        makeDownloader(base, sessionId),
+        makeUploader(base, sessionId),
+        conflict,
+        choice,
+        emptyBaseline(),
+        { tmpDir: "tmp", makeCopyPath }
+      );
+    });
+  }
+
+  try {
+    // 留电脑版本
+    writeFile(remoteRoot, "x.md", "remote-x");
+    writeFile(localRoot, "x.md", "local-x");
+    const r1 = await runChoice(mkConflict("x.md", "local-x", "remote-x"), "remote");
+    assert.equal(r1.errors.length, 0, JSON.stringify(r1.errors));
+    assert.equal(fs.readFileSync(path.join(localRoot, "x.md"), "utf8"), "remote-x");
+
+    // 留手机版本
+    writeFile(localRoot, "y.md", "local-y");
+    writeFile(remoteRoot, "y.md", "remote-y");
+    const r2 = await runChoice(mkConflict("y.md", "local-y", "remote-y"), "local");
+    assert.equal(r2.errors.length, 0, JSON.stringify(r2.errors));
+    assert.equal(fs.readFileSync(path.join(remoteRoot, "y.md"), "utf8"), "local-y");
+
+    // 两份都留
+    writeFile(localRoot, "z.md", "local-z");
+    writeFile(remoteRoot, "z.md", "remote-z");
+    const r3 = await runChoice(mkConflict("z.md", "local-z", "remote-z"), "both", (p) =>
+      `z.conflict-${p}`
+    );
+    assert.equal(r3.errors.length, 0, JSON.stringify(r3.errors));
+    assert.ok(r3.copyPath, "应返回副本路径");
+    assert.equal(fs.readFileSync(path.join(localRoot, "z.md"), "utf8"), "remote-z", "原文件变成电脑版本");
+    assert.equal(fs.readFileSync(path.join(localRoot, r3.copyPath), "utf8"), "local-z", "副本保留本机版本");
+  } finally {
+    await handle.close();
+  }
+});
+
+async function withSession(base, fn) {
+  const start = await fetch(`${base}/api/v1/session/start`, {
+    method: "POST",
+    headers: { "x-lan-sync-token": TOKEN },
+  });
+  const { sessionId } = await start.json();
+  try {
+    return await fn(sessionId);
+  } finally {
+    await fetch(`${base}/api/v1/session/end?sessionId=${sessionId}`, {
+      method: "POST",
+      headers: { "x-lan-sync-token": TOKEN, "x-lan-sync-session": sessionId },
+    });
+  }
+}

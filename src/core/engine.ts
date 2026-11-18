@@ -4,7 +4,7 @@
  */
 import type { ManifestAdapter } from "./manifest";
 import type { Baseline, FileEntry } from "./types";
-import { updateBaseline, type ChangeItem, type SyncPlan } from "./plan";
+import { updateBaseline, type ChangeItem, type ConflictItem, type SyncPlan } from "./plan";
 import { sha256Buffer } from "./hash";
 
 export interface EngineAdapter extends ManifestAdapter {
@@ -243,6 +243,97 @@ export async function applyPushPlan(
     errors,
     bytes,
     newBaseline: updateBaseline(baseline, appliedUploads, appliedDeletes, unchangedRemote),
+  };
+}
+
+export type ConflictChoice = "remote" | "local" | "both";
+
+export interface ConflictApplyOptions {
+  chunkBytes?: number;
+  /** 传输中间文件目录（库内） */
+  tmpDir: string;
+  /** 保留两份时，本机副本的文件名生成器 */
+  makeCopyPath: (path: string) => string;
+  onProgress?: (label: string) => void;
+}
+
+export interface ConflictApplyResult {
+  newBaseline: Baseline;
+  copyPath?: string;
+  errors: string[];
+}
+
+/**
+ * 冲突三选一。
+ * - remote：用电脑版本覆盖本机
+ * - local：用本机版本覆盖电脑
+ * - both：先备份本机版本为冲突副本，再用电脑版本覆盖原文件（副本会在下次同步上传）
+ */
+export async function applyConflictChoice(
+  adapter: EngineAdapter,
+  downloader: FileDownloader,
+  writer: RemoteWriter,
+  conflict: ConflictItem,
+  choice: ConflictChoice,
+  baseline: Baseline,
+  options: ConflictApplyOptions
+): Promise<ConflictApplyResult> {
+  const errors: string[] = [];
+  let copyPath: string | undefined;
+
+  if (choice === "both") {
+    if (conflict.localSha === null && !(await adapter.exists(conflict.path))) {
+      return { newBaseline: baseline, errors: ["本机文件已不存在"] };
+    }
+    try {
+      const data = await adapter.readBinary(conflict.path);
+      copyPath = options.makeCopyPath(conflict.path);
+      await ensureDir(adapter, dirname(copyPath));
+      await adapter.writeBinary(copyPath, data);
+    } catch (err: any) {
+      return { newBaseline: baseline, errors: [`备份冲突副本失败：${(err && err.message) || err}`] };
+    }
+  }
+
+  if (choice === "remote" || choice === "both") {
+    const plan = conflictPlan({ downloads: [conflictToItem(conflict, "remote")] });
+    const result = await applyPullPlan(adapter, downloader, plan, baseline, {
+      tmpDir: options.tmpDir,
+      remoteEntries: [],
+      onProgress: () => options.onProgress?.(`写入 ${conflict.path}`),
+    });
+    for (const item of result.errors) errors.push(item.message);
+    return { newBaseline: result.newBaseline, copyPath, errors };
+  }
+
+  const plan = conflictPlan({ uploads: [conflictToItem(conflict, "local")] });
+  const result = await applyPushPlan(adapter, writer, plan, baseline, {
+    chunkBytes: options.chunkBytes,
+    remoteEntries: [],
+    onProgress: () => options.onProgress?.(`上传 ${conflict.path}`),
+  });
+  for (const item of result.errors) errors.push(item.message);
+  return { newBaseline: result.newBaseline, errors };
+}
+
+function conflictToItem(conflict: ConflictItem, side: "remote" | "local"): ChangeItem {
+  return side === "remote"
+    ? { path: conflict.path, size: conflict.remoteSize, sha256: conflict.remoteSha, mtime: 0 }
+    : { path: conflict.path, size: conflict.localSize, sha256: conflict.localSha, mtime: 0 };
+}
+
+function conflictPlan(parts: { downloads?: ChangeItem[]; uploads?: ChangeItem[] }): SyncPlan {
+  return {
+    downloads: parts.downloads ?? [],
+    uploads: parts.uploads ?? [],
+    deleteLocal: [],
+    deleteRemote: [],
+    conflicts: [],
+    skipped: [],
+    unchanged: 0,
+    unchangedPaths: [],
+    breaker: null,
+    totals: { localFiles: 0, remoteFiles: 0 },
   };
 }
 

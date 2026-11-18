@@ -245,3 +245,53 @@ function makeMemoryAdapter(tree) {
     },
   };
 }
+
+test("计划：小库也不能被「另一端清空」全部删掉", () => {
+  const base = baseOf({ "a.md": "v1", "b.md": "v1", "c.md": "v1", "d.md": "v1", "e.md": "v1" });
+  const local = Object.keys(base.entries).map((p) => entry(p, "v1"));
+  const plan = planSync(local, [], base, { mode: "both" });
+  assert.equal(plan.deleteLocal.length, 5);
+  assert.ok(plan.breaker, "5 个文件全删、占基线 100%，必须熔断");
+  assert.match(plan.breaker.message, /基线/);
+});
+
+test("计划：正常改动少量文件不触发基线半数熔断", () => {
+  const base = baseOf({});
+  const local = [];
+  const remote = [];
+  for (let i = 0; i < 6; i++) {
+    base.entries[`f${i}.md`] = { size: 10, sha256: "v1" };
+    local.push(entry(`f${i}.md`, "v1"));
+    remote.push(entry(`f${i}.md`, "v1"));
+  }
+  // 电脑端 6 个里删 2 个（本机删 2 个，<3 个）不熔断；删 4 个（>=3 且超半数）应熔断
+  const plan2 = planSync(local, remote.slice(0, 4), base, { mode: "both" });
+  assert.equal(plan2.deleteLocal.length, 2);
+  assert.equal(plan2.breaker, null);
+
+  const plan3 = planSync(local, remote.slice(0, 2), base, { mode: "both" });
+  assert.equal(plan3.deleteLocal.length, 4);
+  assert.ok(plan3.breaker, "6 个删 4 个（>半数且>=3）应熔断");
+});
+
+test("计划：首次同步可选「以电脑为准」批量覆盖", () => {
+  const local = [entry("a.md", "local-a"), entry("b.md", "same")];
+  const remote = [entry("a.md", "remote-a"), entry("b.md", "same")];
+
+  const asConflict = planSync(local, remote, emptyBaseline(), { mode: "both" });
+  assert.equal(asConflict.conflicts.length, 1);
+
+  const preferRemote = planSync(local, remote, emptyBaseline(), {
+    mode: "both",
+    noBaseStrategy: "prefer-remote",
+  });
+  assert.deepEqual(preferRemote.downloads.map((d) => d.path), ["a.md"]);
+  assert.equal(preferRemote.conflicts.length, 0);
+
+  const preferLocal = planSync(local, remote, emptyBaseline(), {
+    mode: "both",
+    noBaseStrategy: "prefer-local",
+  });
+  assert.deepEqual(preferLocal.uploads.map((u) => u.path), ["a.md"]);
+  assert.equal(preferLocal.conflicts.length, 0);
+});

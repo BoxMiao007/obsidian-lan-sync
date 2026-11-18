@@ -31,6 +31,8 @@ export interface LanSyncSettings {
   syncIntervalMinutes: number;
   /** 是否同步第三方插件的 data.json（含凭据，默认关闭） */
   syncPluginData: boolean;
+  /** 首次同步时两边都有但内容不同怎么办 */
+  firstSyncStrategy: "conflict" | "prefer-remote" | "prefer-local";
 }
 
 export const DEFAULT_SETTINGS: LanSyncSettings = {
@@ -48,6 +50,7 @@ export const DEFAULT_SETTINGS: LanSyncSettings = {
   syncDebounceSeconds: 10,
   syncIntervalMinutes: 0,
   syncPluginData: false,
+  firstSyncStrategy: "conflict",
 };
 
 export class LanSyncSettingTab extends PluginSettingTab {
@@ -382,6 +385,28 @@ export class LanSyncSettingTab extends PluginSettingTab {
               this.plugin.settings.syncIntervalMinutes = parsed;
               await this.plugin.saveSettings();
             }
+          })
+      );
+
+    new Setting(card)
+      .setName("首次同步冲突处理")
+      .setDesc(
+        "手机里已有旧副本（比如坚果云留下的）时，两边同名但内容不同会按这里处理：默认逐条询问；也可以一次性「以电脑为准」覆盖手机，或反过来。"
+      )
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({
+            conflict: "逐条询问（最安全）",
+            "prefer-remote": "以电脑为准（覆盖本机同名文件）",
+            "prefer-local": "以本机为准（覆盖电脑同名文件）",
+          })
+          .setValue(this.plugin.settings.firstSyncStrategy)
+          .onChange(async (value) => {
+            this.plugin.settings.firstSyncStrategy = value as
+              | "conflict"
+              | "prefer-remote"
+              | "prefer-local";
+            await this.plugin.saveSettings();
           })
       );
 

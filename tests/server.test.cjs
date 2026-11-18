@@ -201,3 +201,26 @@ test("v1 同步会话：同一时刻只允许一个客户端", async () => {
     headers: AUTH,
   });
 });
+
+test("一次性下载 zip 且能解出三个文件", async () => {
+  const resp = await fetch(`${base}/install/all.zip?token=${TOKEN}`);
+  assert.equal(resp.status, 200);
+  assert.match(resp.headers.get("content-type") || "", /application\/zip/);
+  const buf = Buffer.from(await resp.arrayBuffer());
+  assert.ok(buf.length > 1000, "zip 内容不能是空的");
+  assert.equal(buf.readUInt32LE(0), 0x04034b50, "应以 PK\\x03\\x04 开头");
+
+  // 解析中央目录，确认三个文件都在
+  const endIndex = buf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  assert.ok(endIndex > 0, "应有 EOCD");
+  const count = buf.readUInt16LE(endIndex + 10);
+  assert.equal(count, 4, "应包含 main.js / manifest.json / styles.css / 安装说明.txt");
+
+  const text = buf.toString("utf8");
+  for (const name of ["main.js", "manifest.json", "styles.css"]) {
+    assert.ok(text.includes(name), `zip 里应含 ${name}`);
+  }
+
+  const denied = await fetch(`${base}/install/all.zip?token=000000`);
+  assert.equal(denied.status, 401);
+});

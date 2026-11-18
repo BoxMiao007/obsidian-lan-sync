@@ -9,6 +9,8 @@ import { entryMap } from "./types";
 
 export type PlanMode = "pull" | "push" | "both";
 
+export type NoBaseStrategy = "conflict" | "prefer-remote" | "prefer-local";
+
 export interface PlanOptions {
   /** pull = 只把远端改动落到本机；push = 只把本机改动推到远端；both = 双向 */
   mode: PlanMode;
@@ -16,6 +18,11 @@ export interface PlanOptions {
   maxDeletes?: number;
   /** 一次同步允许的最大删除比例，默认 0.3（30%） */
   maxDeleteRatio?: number;
+  /**
+   * 没有基线时两边都有同一文件且内容不同，怎么处理。
+   * 默认 conflict（最安全）；首次同步时用户可显式选 prefer-remote / prefer-local。
+   */
+  noBaseStrategy?: NoBaseStrategy;
 }
 
 export interface ChangeItem {
@@ -89,7 +96,14 @@ export function planSync(
         continue;
       }
       if (!b) {
-        plan.conflicts.push(conflict("no-base", l, r));
+        const strategy = options.noBaseStrategy ?? "conflict";
+        if (strategy === "prefer-remote") {
+          plan.downloads.push(toItem(r));
+        } else if (strategy === "prefer-local") {
+          plan.uploads.push(toItem(l));
+        } else {
+          plan.conflicts.push(conflict("no-base", l, r));
+        }
         continue;
       }
       const localChanged = changedSinceBase(l, b);
@@ -129,7 +143,7 @@ export function planSync(
   }
 
   applyMode(plan, options.mode);
-  applyBreaker(plan, options);
+  applyBreaker(plan, options, Object.keys(base).length);
   return plan;
 }
 
@@ -160,7 +174,7 @@ function applyMode(plan: SyncPlan, mode: PlanMode): void {
   plan.deleteLocal = [];
 }
 
-function applyBreaker(plan: SyncPlan, options: PlanOptions): void {
+function applyBreaker(plan: SyncPlan, options: PlanOptions, baselineCount: number): void {
   const deletes = plan.deleteLocal.length + plan.deleteRemote.length;
   if (deletes === 0) return;
 
@@ -175,12 +189,14 @@ function applyBreaker(plan: SyncPlan, options: PlanOptions): void {
   const maxDeletes = options.maxDeletes ?? 20;
   const maxRatio = options.maxDeleteRatio ?? 0.3;
   const ratio = total > 0 ? deletes / total : 0;
-  // 小库不适用比例阈值：3 个文件删 1 个就是 33%，属于正常操作
+  // 小库不适用「占全库比例」阈值：3 个文件删 1 个就是 33%，属于正常操作
   const ratioApplies = total >= 20;
+  // 但小库也要防「另一端莫名其妙空掉」：删除超过基线的一半且至少 3 个，就拦下来
+  const baselineHeavy = baselineCount > 0 && deletes >= 3 && deletes / baselineCount > 0.5;
 
-  if (deletes > maxDeletes || (ratioApplies && ratio > maxRatio)) {
+  if (deletes > maxDeletes || (ratioApplies && ratio > maxRatio) || baselineHeavy) {
     plan.breaker = {
-      message: `本次同步要删除 ${deletes} 个文件（共 ${total} 个，占 ${(ratio * 100).toFixed(0)}%），超过安全阈值（>${maxDeletes} 个${ratioApplies ? `或 >${(maxRatio * 100).toFixed(0)}%` : ""}）。已中止，请检查是否换机/清空目录后重试。`,
+      message: `本次同步要删除 ${deletes} 个文件（共 ${total} 个，占 ${(ratio * 100).toFixed(0)}%；基线 ${baselineCount} 个），超过安全阈值（>${maxDeletes} 个${ratioApplies ? `或 >${(maxRatio * 100).toFixed(0)}%` : ""}，或删除超过基线半数）。已中止，请检查电脑端库路径是否配错、是否换机/清空目录后重试。`,
       deletes,
       total,
     };

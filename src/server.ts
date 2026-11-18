@@ -48,6 +48,16 @@ const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_BLOB_MB = 64;
 const MAX_UPLOAD_BYTES = 128 * 1024 * 1024;
 const PORT_ATTEMPTS = 20;
+const SAFE_PLUGIN_FILES = ["main.js", "manifest.json", "styles.css"];
+const INSTALL_NOTE = `LAN Sync · 手机安装说明
+
+1. 解压后得到 main.js、manifest.json、styles.css
+2. 把这三个文件放进 Obsidian 库的 .obsidian/plugins/lan-sync/ 目录
+   （没有 lan-sync 文件夹就新建，三个文件必须平铺在里面）
+3. 完全退出 Obsidian 再打开
+4. 设置 → 第三方插件 → 启用「LAN Sync · 局域网同步」
+5. 在插件设置里填电脑 IP、端口、配对码，先点「完整自检」
+`;
 
 interface UploadState {
   path: string;
@@ -144,7 +154,85 @@ export async function createSyncServer(opts: SyncServerOptions): Promise<SyncSer
     return { generatedAt: Date.now(), entries };
   };
 
-  const resolveVaultFile = (relPath: string): string | null => {
+  /** 最小 ZIP 打包（仅 store，无压缩）：手机端一次下载三个文件，省得逐个点。 */
+function buildZip(files: Array<{ name: string; data: any }>): any {
+  const crcTable: number[] = [];
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    crcTable[n] = c >>> 0;
+  }
+  const crc32 = (buf: any): number => {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) c = crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+
+  const locals: any[] = [];
+  const centrals: any[] = [];
+  let offset = 0;
+  const now = new Date();
+  const dosTime = ((now.getHours() << 11) | (now.getMinutes() << 5) | Math.floor(now.getSeconds() / 2)) & 0xffff;
+  const dosDate = (((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()) & 0xffff;
+
+  for (const file of files) {
+    const nameBuf = Buffer.from(file.name, "utf8");
+    const data = file.data;
+    const crc = crc32(data);
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6); // UTF-8 文件名
+    local.writeUInt16LE(0, 8); // store
+    local.writeUInt16LE(dosTime, 10);
+    local.writeUInt16LE(dosDate, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    local.writeUInt16LE(0, 28);
+    locals.push(local, nameBuf, data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(dosTime, 12);
+    central.writeUInt16LE(dosDate, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(offset, 42);
+    centrals.push(central, nameBuf);
+
+    offset += local.length + nameBuf.length + data.length;
+  }
+
+  const localBlob = Buffer.concat(locals);
+  const centralBlob = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centralBlob.length, 12);
+  end.writeUInt32LE(localBlob.length, 16);
+  end.writeUInt16LE(0, 20);
+
+  return Buffer.concat([localBlob, centralBlob, end]);
+}
+
+const resolveVaultFile = (relPath: string): string | null => {
     const root: string = opts.vaultDir as string;
     const normalized = String(relPath || "").replace(/\\/g, "/");
     if (!normalized || normalized.includes("..") || normalized.startsWith("/")) return null;
@@ -239,12 +327,14 @@ export async function createSyncServer(opts: SyncServerOptions): Promise<SyncSer
           const fileLinks = ["main.js", "manifest.json", "styles.css"]
             .map((name) => `<li><a href="/install/file?name=${name}&token=${encodeURIComponent(token)}">${name}</a></li>`)
             .join("");
+          const zipLink = `<p><a class="zip" href="/install/all.zip?token=${encodeURIComponent(token)}">⬇ 一次下载全部（lan-sync.zip）</a></p>`;
           const html = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>LAN Sync 安装</title>
 <style>body{font-family:system-ui,sans-serif;margin:24px;line-height:1.6;max-width:720px}
 code{background:#eee;padding:2px 4px;border-radius:3px}a{color:#2563eb}
+a.zip{display:inline-block;padding:10px 16px;background:#2563eb;color:#fff;border-radius:6px;text-decoration:none;font-weight:600}
 #result{font-weight:600}</style></head>
 <body>
 <h1>LAN Sync · 手机安装助手</h1>
@@ -252,10 +342,12 @@ code{background:#eee;padding:2px 4px;border-radius:3px}a{color:#2563eb}
 <p><button id="test">测试 /api/ping</button> <span id="result">未测试</span></p>
 <h2>下载插件文件</h2>
 <p>当前页面链接里的配对码：<code>${token ? "已带上" : "缺失，请从电脑设置页复制完整链接"}</code></p>
+${zipLink}
+<p>或者逐个下载：</p>
 <ul>${fileLinks}</ul>
 <h2>安装步骤</h2>
 <ol>
-<li>把上面三个文件下载到手机。</li>
+<li>把下载到的文件（推荐用上面的 zip）解压到手机。</li>
 <li>用手机文件管理器把它们放进 Obsidian 库的 <code>.obsidian/plugins/lan-sync/</code> 目录（没有就新建）。</li>
 <li>重启 Obsidian → 设置 → 第三方插件 → 启用「LAN Sync · 局域网同步」。</li>
 <li>在插件设置里填电脑 IP、端口、配对码，点「完整自检」。</li>
@@ -283,13 +375,38 @@ document.getElementById("test").addEventListener("click", async () => {
           return;
         }
 
+        if (pathname === "/install/all.zip" && req.method === "GET") {
+          if (!authorized()) {
+            sendJson(401, { ok: false, error: "配对码不正确" });
+            return;
+          }
+          if (!opts.pluginDir) {
+            sendJson(404, { ok: false, error: "无法定位插件目录" });
+            return;
+          }
+          const files: Array<{ name: string; data: any }> = [];
+          for (const name of SAFE_PLUGIN_FILES) {
+            const filePath = path.join(opts.pluginDir, name);
+            if (!fs.existsSync(filePath)) continue;
+            files.push({ name, data: fs.readFileSync(filePath) });
+          }
+          files.push({ name: "安装说明.txt", data: Buffer.from(INSTALL_NOTE, "utf8") });
+          const zip = buildZip(files);
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/zip");
+          res.setHeader("Content-Length", String(zip.length));
+          res.setHeader("Content-Disposition", 'attachment; filename="lan-sync.zip"');
+          res.end(zip);
+          return;
+        }
+
         if (pathname === "/install/file" && req.method === "GET") {
           if (!authorized()) {
             sendJson(401, { ok: false, error: "配对码不正确" });
             return;
           }
           const name = url.searchParams.get("name") || "";
-          if (!["main.js", "manifest.json", "styles.css"].includes(name) || !opts.pluginDir) {
+          if (!SAFE_PLUGIN_FILES.includes(name) || !opts.pluginDir) {
             sendJson(404, { ok: false, error: "文件不存在" });
             return;
           }
