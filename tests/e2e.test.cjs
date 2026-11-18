@@ -375,3 +375,36 @@ test("端到端：push 把本机修改/新增/删除推到电脑", async () => {
     await handle.close();
   }
 });
+
+test("端到端：两端同时修改 → 冲突，双方文件原样保留", async () => {
+  const remoteRoot = makeTempDir("lan-remote6-");
+  const localRoot = makeTempDir("lan-local6-");
+  writeFile(remoteRoot, "a.md", "base v1", 1700000000);
+
+  const handle = await createSyncServer({
+    port: 39305,
+    token: TOKEN,
+    uploadDir: path.join(remoteRoot, ".tmp-upload"),
+    vaultDir: remoteRoot,
+    ignore: IGNORE,
+    log: () => {},
+  });
+
+  try {
+    const base = `http://127.0.0.1:${handle.port}`;
+    await pullOnce(base, localRoot);
+
+    writeFile(remoteRoot, "a.md", "remote v2", 1700000400);
+    writeFile(localRoot, "a.md", "local v2", 1700000400);
+
+    const { plan, result } = await syncOnce(base, localRoot, undefined, "both");
+    assert.equal(plan.conflicts.length, 1);
+    assert.equal(plan.conflicts[0].reason, "both-modified");
+    assert.equal(plan.downloads.length + plan.uploads.length, 0);
+    assert.equal(result.bytes, 0);
+    assert.equal(fs.readFileSync(path.join(localRoot, "a.md"), "utf8"), "local v2");
+    assert.equal(fs.readFileSync(path.join(remoteRoot, "a.md"), "utf8"), "remote v2");
+  } finally {
+    await handle.close();
+  }
+});

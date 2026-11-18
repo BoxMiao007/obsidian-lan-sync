@@ -381,7 +381,10 @@ document.getElementById("test").addEventListener("click", async () => {
             }
           }
           const cached = manifestCache.get(String(url.searchParams.get("path") || ""));
-          const fileSha = cached && cached.size === size ? cached.sha256 : null;
+          const fileSha =
+            cached && cached.size === size && cached.mtime === Math.trunc(stat.mtimeMs || 0)
+              ? cached.sha256
+              : null;
 
           res.statusCode = 200;
           res.setHeader("Content-Type", "application/octet-stream");
