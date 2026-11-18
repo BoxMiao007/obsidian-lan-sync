@@ -21,11 +21,22 @@
 - **大文件必须分块**：手机端 `readBinary`/`writeBinary`/`requestUrl` 都是整包缓冲，20–50MB 就可能 OOM 崩掉 Obsidian。
 - **明文 HTTP 只在安卓当前版本可用**：iOS 已被 ATS 封死；安卓属于过渡期机制，未来可能要切换自签 HTTPS。
 
-## 安装（BRAT）
+## 安装
 
-1. 把本仓库推到 GitHub（`.github/workflows/release.yml` 会在打 tag 时自动构建并挂出三个文件）。
-2. 手机端装 BRAT 插件 → Add Beta plugin → 填 `你的用户名/obsidian-lan-sync`。
-3. 或者手动：把 `main.js` / `manifest.json` / `styles.css` 放进 `<库>/.obsidian/plugins/lan-sync/`。
+### 方式一：BRAT（手机端推荐，可自动更新）
+
+1. 手机端先装 [BRAT](https://github.com/TfTHacker/obsidian42-brat) 插件。
+2. BRAT → Add Beta plugin → 填 `BoxMiao007/obsidian-lan-sync` → 添加。
+3. 回插件列表启用「LAN Sync · 局域网同步」。
+
+### 方式二：局域网一键安装（首次配对最方便）
+
+电脑端服务启动后，手机浏览器打开设置页显示的那个带 token 的地址，
+点「⬇ 一次下载全部（lan-sync.zip）」，解压后把三件套放进 `<库>/.obsidian/plugins/lan-sync/`。
+
+### 方式三：手动
+
+从 [Releases](https://github.com/BoxMiao007/obsidian-lan-sync/releases) 下载 `main.js`、`manifest.json`、`styles.css` 放进插件目录。
 
 ## 已知限制
 
