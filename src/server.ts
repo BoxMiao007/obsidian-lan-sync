@@ -65,6 +65,8 @@ export async function createSyncServer(opts: SyncServerOptions): Promise<SyncSer
   const log = opts.log ?? (() => {});
   const uploads = new Map<string, UploadState>();
   const v1Uploads = new Map<string, { path: string; size: number; sha256: string | null; received: number }>();
+  let activeSession: { id: string; startedAt: number } | null = null;
+  const SESSION_TTL_MS = 60 * 60 * 1000;
   const blobCache = new Map<string, any>();
 
   const uploadRoot = path.join(opts.uploadDir, "spike-uploads");
@@ -315,7 +317,36 @@ document.getElementById("test").addEventListener("click", async () => {
         }
 
         // ===== v1 同步协议 =====
+        if (pathname === "/api/v1/session/start" && req.method === "POST") {
+          if (activeSession && Date.now() - activeSession.startedAt < SESSION_TTL_MS) {
+            sendJson(409, { ok: false, error: "另一台设备正在同步，请稍后再试" });
+            return;
+          }
+          const id = crypto.randomBytes(8).toString("hex");
+          activeSession = { id, startedAt: Date.now() };
+          sendJson(200, { ok: true, sessionId: id });
+          return;
+        }
+
+        if (pathname === "/api/v1/session/end" && req.method === "POST") {
+          const id = url.searchParams.get("sessionId") || req.headers["x-lan-sync-session"] || "";
+          if (activeSession && activeSession.id === id) activeSession = null;
+          sendJson(200, { ok: true });
+          return;
+        }
+
+        // 其余 v1 接口都要求持有一个有效会话，保证同一时刻只有一个客户端在同步
+        const requireSession = () => {
+          const id = String(req.headers["x-lan-sync-session"] || "");
+          if (!activeSession || activeSession.id !== id) {
+            const error: any = new Error("同步会话无效或已过期，请重新开始同步");
+            error.statusCode = 409;
+            throw error;
+          }
+        };
+
         if (pathname === "/api/v1/manifest" && req.method === "GET") {
+          requireSession();
           if (!opts.vaultDir) throw new Error("服务端未配置 vaultDir");
           const manifest = await buildServerManifest();
           sendJson(200, { ok: true, ...manifest });
@@ -323,6 +354,7 @@ document.getElementById("test").addEventListener("click", async () => {
         }
 
         if (pathname === "/api/v1/file" && req.method === "GET") {
+          requireSession();
           if (!opts.vaultDir) throw new Error("服务端未配置 vaultDir");
           const abs = resolveVaultFile(url.searchParams.get("path") || "");
           if (!abs) throw new Error("路径不合法");
@@ -363,6 +395,7 @@ document.getElementById("test").addEventListener("click", async () => {
 
         // 手机 → 电脑上传：先写临时文件，校验通过后原子替换目标
         if (pathname === "/api/v1/upload/init" && req.method === "POST") {
+          requireSession();
           if (!opts.vaultDir) throw new Error("服务端未配置 vaultDir");
           const body = await readBody(req, 64 * 1024);
           const info = JSON.parse(body.toString("utf8") || "{}");
@@ -386,6 +419,7 @@ document.getElementById("test").addEventListener("click", async () => {
         }
 
         if (pathname === "/api/v1/upload/chunk" && req.method === "POST") {
+          requireSession();
           const id = url.searchParams.get("uploadId") || "";
           const state = v1Uploads.get(id);
           if (!state) throw new Error("uploadId 不存在");
@@ -404,6 +438,7 @@ document.getElementById("test").addEventListener("click", async () => {
         }
 
         if (pathname === "/api/v1/upload/finish" && req.method === "POST") {
+          requireSession();
           if (!opts.vaultDir) throw new Error("服务端未配置 vaultDir");
           const id = url.searchParams.get("uploadId") || "";
           const state = v1Uploads.get(id);
@@ -441,6 +476,7 @@ document.getElementById("test").addEventListener("click", async () => {
         }
 
         if (pathname === "/api/v1/file" && req.method === "DELETE") {
+          requireSession();
           if (!opts.vaultDir) throw new Error("服务端未配置 vaultDir");
           const rel = url.searchParams.get("path") || "";
           if (!rel || rel.includes("..") || isIgnored(rel, ignoreConfig)) throw new Error("路径不合法");
@@ -526,7 +562,10 @@ document.getElementById("test").addEventListener("click", async () => {
 
         sendJson(404, { ok: false, error: `未知接口 ${pathname}` });
       } catch (err: any) {
-        sendJson(500, { ok: false, error: String((err && err.message) || err) });
+        sendJson(err && err.statusCode ? err.statusCode : 500, {
+          ok: false,
+          error: String((err && err.message) || err),
+        });
       } finally {
         if (pathname !== "/api/blob") {
           log(`${req.method} ${pathname} ${res.statusCode} ${Date.now() - startedAt}ms`);

@@ -16,6 +16,8 @@ export interface RemoteChunkMeta {
 }
 
 export class HttpRemote {
+  private sessionId: string | null = null;
+
   constructor(
     private readonly base: string,
     private readonly token: string,
@@ -23,7 +25,47 @@ export class HttpRemote {
   ) {}
 
   private headers(): Record<string, string> {
-    return { "x-lan-sync-token": this.token };
+    const headers: Record<string, string> = { "x-lan-sync-token": this.token };
+    if (this.sessionId) headers["x-lan-sync-session"] = this.sessionId;
+    return headers;
+  }
+
+  /** 服务端同一时刻只允许一个同步会话，避免两台设备交叉写 */
+  async startSession(): Promise<void> {
+    const resp = await withTimeout(
+      requestUrl({
+        url: `${this.base}/api/v1/session/start`,
+        method: "POST",
+        headers: this.headers(),
+        throw: false,
+      }),
+      15000,
+      "建立同步会话"
+    );
+    if (resp.status !== 200 || !resp.json?.sessionId) {
+      throw new Error(resp.json?.error || `无法开始同步（HTTP ${resp.status}）`);
+    }
+    this.sessionId = resp.json.sessionId;
+  }
+
+  async endSession(): Promise<void> {
+    if (!this.sessionId) return;
+    const id = this.sessionId;
+    this.sessionId = null;
+    try {
+      await withTimeout(
+        requestUrl({
+          url: `${this.base}/api/v1/session/end?sessionId=${id}`,
+          method: "POST",
+          headers: { "x-lan-sync-token": this.token, "x-lan-sync-session": id },
+          throw: false,
+        }),
+        5000,
+        "结束同步会话"
+      );
+    } catch {
+      /* 服务端有 10 分钟超时兜底 */
+    }
   }
 
   async fetchManifest(timeoutMs = 60000): Promise<Manifest> {

@@ -22,6 +22,7 @@ test.before(async () => {
     token: TOKEN,
     uploadDir: fs.mkdtempSync(path.join(os.tmpdir(), "lan-sync-test-")),
     pluginDir: path.resolve(__dirname, ".."),
+    vaultDir: fs.mkdtempSync(path.join(os.tmpdir(), "lan-sync-vault-")),
     log: () => {},
   });
   base = `http://127.0.0.1:${handle.port}`;
@@ -163,4 +164,40 @@ test("安装文件下载需要配对码且内容正确", async () => {
 
   const traversal = await fetch(`${base}/install/file?name=../package.json&token=${TOKEN}`);
   assert.equal(traversal.status, 404);
+});
+
+test("v1 同步会话：同一时刻只允许一个客户端", async () => {
+  const first = await fetch(`${base}/api/v1/session/start`, { method: "POST", headers: AUTH });
+  assert.equal(first.status, 200);
+  const { sessionId } = await first.json();
+  assert.ok(sessionId);
+
+  const second = await fetch(`${base}/api/v1/session/start`, { method: "POST", headers: AUTH });
+  assert.equal(second.status, 409, "第二个会话应被拒绝");
+  const secondBody = await second.json();
+  assert.match(secondBody.error, /另一台设备/);
+
+  const noSession = await fetch(`${base}/api/v1/manifest`, { headers: AUTH });
+  assert.equal(noSession.status, 409, "无会话请求清单应被拒绝");
+
+  const ok = await fetch(`${base}/api/v1/manifest`, {
+    headers: { ...AUTH, "x-lan-sync-session": sessionId },
+  });
+  assert.equal(ok.status, 200);
+  const manifest = await ok.json();
+  assert.ok(Array.isArray(manifest.entries));
+
+  const end = await fetch(`${base}/api/v1/session/end?sessionId=${sessionId}`, {
+    method: "POST",
+    headers: AUTH,
+  });
+  assert.equal(end.status, 200);
+
+  const third = await fetch(`${base}/api/v1/session/start`, { method: "POST", headers: AUTH });
+  assert.equal(third.status, 200, "结束后应能重新建立会话");
+  const thirdBody = await third.json();
+  await fetch(`${base}/api/v1/session/end?sessionId=${thirdBody.sessionId}`, {
+    method: "POST",
+    headers: AUTH,
+  });
 });

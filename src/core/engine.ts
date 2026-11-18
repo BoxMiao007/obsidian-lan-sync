@@ -142,6 +142,8 @@ export async function applyPullPlan(
 export interface PushApplyOptions {
   chunkBytes?: number;
   remoteEntries: FileEntry[];
+  /** 单文件上传上限，默认 32MB：手机端 readBinary 是整包读，超过会 OOM */
+  maxUploadBytes?: number;
   onProgress?: (info: { done: number; total: number; label: string; bytes: number }) => void;
 }
 
@@ -168,6 +170,7 @@ export async function applyPushPlan(
   }
 
   const chunkBytes = options.chunkBytes ?? 4 * 1024 * 1024;
+  const maxUploadBytes = options.maxUploadBytes ?? 32 * 1024 * 1024;
   const total = plan.uploads.length + plan.deleteRemote.length;
   let done = 0;
   let bytes = 0;
@@ -175,6 +178,9 @@ export async function applyPushPlan(
   for (let i = 0; i < plan.uploads.length; i++) {
     const item = plan.uploads[i];
     try {
+      if (item.size > maxUploadBytes) {
+        throw new Error(`文件 ${(item.size / 1048576).toFixed(1)}MB 超过上传上限（${(maxUploadBytes / 1048576).toFixed(0)}MB），暂不支持`);
+      }
       const buffer = await adapter.readBinary(item.path);
       if (buffer.byteLength !== item.size) {
         throw new Error(`文件在扫描后发生变化（${buffer.byteLength}/${item.size}），请重新同步`);

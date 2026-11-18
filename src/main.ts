@@ -150,7 +150,11 @@ export default class LanSyncPlugin extends Plugin {
   }
 
   ignoreConfig(): IgnoreConfig {
-    return { configDir: this.app.vault.configDir, selfPluginId: "lan-sync" };
+    return {
+      configDir: this.app.vault.configDir,
+      selfPluginId: "lan-sync",
+      syncPluginData: this.settings.syncPluginData,
+    };
   }
 
   async loadBaseline(): Promise<Baseline> {
@@ -293,7 +297,8 @@ export default class LanSyncPlugin extends Plugin {
     new ReportModal(this.app, report).open();
   }
 
-  async runSync(auto = false): Promise<void> {    if (this.syncRunning) {
+  async runSync(auto = false): Promise<void> {
+    if (this.syncRunning) {
       new Notice("同步正在进行，请稍候…");
       return;
     }
@@ -308,6 +313,7 @@ export default class LanSyncPlugin extends Plugin {
 
     this.syncRunning = true;
     const notice = new Notice("正在扫描本机文件…", 0);
+    let remote: HttpRemote | null = null;
     try {
       const adapter: any = this.app.vault.adapter;
       const local = await buildManifest(adapter, {
@@ -320,9 +326,21 @@ export default class LanSyncPlugin extends Plugin {
 
       notice.setMessage("正在获取电脑上的文件清单…");
       const chunkBytes = Math.max(0.25, this.settings.chunkMB) * 1024 * 1024;
-      const remote = new HttpRemote(target.base, target.token, chunkBytes);
-      const remoteManifest = await remote.fetchManifest();
+      const remoteClient = new HttpRemote(target.base, target.token, chunkBytes);
+      remote = remoteClient;
+      await remoteClient.startSession();
+      const remoteManifest = await remoteClient.fetchManifest();
       const baseline = await this.loadBaseline();
+
+      // 清理基线里已经不在任何一端的条目（例如后来加入了新的忽略规则）
+      const knownPaths = new Set([
+        ...local.entries.map((entry) => entry.path),
+        ...remoteManifest.entries.map((entry) => entry.path),
+      ]);
+      for (const key of Object.keys(baseline.entries)) {
+        if (!knownPaths.has(key)) delete baseline.entries[key];
+      }
+
       const plan = planSync(local.entries, remoteManifest.entries, baseline, {
         mode: this.settings.syncMode,
         maxDeletes: this.settings.maxDeletes,
@@ -343,7 +361,7 @@ export default class LanSyncPlugin extends Plugin {
       const mustPreview = !auto || baseline.updatedAt === 0 || Boolean(plan.breaker) || plan.conflicts.length > 0;
       if (!mustPreview) {
         // 自动同步：无人值守时不弹预览，直接应用（首次同步 / 冲突 / 熔断仍然会弹）
-        await this.applySync(plan, remote, remoteManifest.entries, baseline);
+        await this.applySync(plan, remoteClient, remoteManifest.entries, baseline);
         return;
       }
 
@@ -353,12 +371,13 @@ export default class LanSyncPlugin extends Plugin {
         remoteCount: remoteManifest.entries.length,
         firstSync: baseline.updatedAt === 0,
         mode: this.settings.syncMode,
-        onConfirm: () => this.applySync(plan, remote, remoteManifest.entries, baseline),
+        onConfirm: () => this.applySync(plan, remoteClient, remoteManifest.entries, baseline),
       }).open();
     } catch (err) {
       notice.hide();
       new ReportModal(this.app, `同步失败：${errMsg(err)}`).open();
     } finally {
+      if (remote) await remote.endSession();
       this.syncRunning = false;
       this.lastSyncAt = Date.now();
     }
@@ -472,7 +491,10 @@ export default class LanSyncPlugin extends Plugin {
     const remote = new HttpRemote(target.base, target.token, chunkBytes);
     const adapter: any = this.app.vault.adapter;
     this.applying = true;
+    let sessionStarted = false;
     try {
+      await remote.startSession();
+      sessionStarted = true;
       const baseline = await this.loadBaseline();
     const remoteItem: ChangeItem = {
       path: conflict.path,
@@ -515,6 +537,7 @@ export default class LanSyncPlugin extends Plugin {
     }
     this.log(`解决冲突：${conflict.path} → ${choice}`);
     } finally {
+      if (sessionStarted) await remote.endSession();
       this.applying = false;
     }
   }

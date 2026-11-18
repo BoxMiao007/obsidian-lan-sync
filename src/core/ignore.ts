@@ -10,6 +10,12 @@ export interface IgnoreConfig {
   selfPluginId?: string;
   /** 额外忽略模式，支持 ** / * / ? */
   extraPatterns?: string[];
+  /**
+   * 是否同步各插件的 data.json。默认 false：
+   * 这些文件里常有第三方服务的密码或令牌（本库的 nutstore-sync、obsidian-git 都有），
+   * 明文 HTTP 传出去等于裸奔。
+   */
+  syncPluginData?: boolean;
 }
 
 /** 统一成 POSIX 风格相对路径：反斜杠转正斜杠、去掉前导 ./ 和 / */
@@ -53,6 +59,12 @@ export function isIgnored(path: string, config: IgnoreConfig): boolean {
     if (normalized === selfDir || normalized.startsWith(`${selfDir}/`)) return true;
   }
 
+  // 插件设置文件默认不同步：里面常有第三方服务凭据
+  if (!config.syncPluginData && isPluginDataFile(normalized, configDir)) return true;
+
+  // 桌面端的 git 凭据助手脚本，手机端没有意义且涉及凭据流程
+  if (normalized.endsWith("askpass.sh")) return true;
+
   for (const pattern of config.extraPatterns || []) {
     if (!pattern) continue;
     if (globToRegExp(pattern).test(normalized)) return true;
@@ -66,6 +78,14 @@ export function filterIgnored<T extends { path: string }>(entries: T[], config: 
 }
 
 const globCache = new Map<string, RegExp>();
+
+function isPluginDataFile(path: string, configDir: string): boolean {
+  const prefix = `${configDir}/plugins/`;
+  if (!path.startsWith(prefix)) return false;
+  const rest = path.slice(prefix.length);
+  const parts = rest.split("/");
+  return parts.length === 2 && parts[1] === "data.json";
+}
 
 /** 只支持 ** / * / ? 的最小实现，够覆盖「忽略某某目录」这类配置。 */
 export function globToRegExp(pattern: string): RegExp {

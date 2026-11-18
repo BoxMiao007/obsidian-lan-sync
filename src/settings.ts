@@ -29,6 +29,8 @@ export interface LanSyncSettings {
   syncDebounceSeconds: number;
   /** 定时同步间隔（分钟），0 = 关闭 */
   syncIntervalMinutes: number;
+  /** 是否同步第三方插件的 data.json（含凭据，默认关闭） */
+  syncPluginData: boolean;
 }
 
 export const DEFAULT_SETTINGS: LanSyncSettings = {
@@ -45,6 +47,7 @@ export const DEFAULT_SETTINGS: LanSyncSettings = {
   syncOnOpen: true,
   syncDebounceSeconds: 10,
   syncIntervalMinutes: 0,
+  syncPluginData: false,
 };
 
 export class LanSyncSettingTab extends PluginSettingTab {
@@ -380,6 +383,18 @@ export class LanSyncSettingTab extends PluginSettingTab {
               await this.plugin.saveSettings();
             }
           })
+      );
+
+    new Setting(card)
+      .setName("同步第三方插件设置（危险）")
+      .setDesc(
+        "默认关闭。开启后会把各插件的 data.json 一并同步，而其中可能含坚果云、GitHub 等第三方服务的密码/令牌，局域网明文传输有泄露风险。"
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.syncPluginData).onChange(async (value) => {
+          this.plugin.settings.syncPluginData = value;
+          await this.plugin.saveSettings();
+        })
       );
   }
 

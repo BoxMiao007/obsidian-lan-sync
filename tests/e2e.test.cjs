@@ -86,7 +86,7 @@ function createNodeAdapter(root) {
   };
 }
 
-function makeDownloader(base, chunkBytes = 64 * 1024) {
+function makeDownloader(base, sessionId, chunkBytes = 64 * 1024) {
   return {
     async downloadFile(filePath, size, onChunk) {
       let offset = 0;
@@ -94,7 +94,9 @@ function makeDownloader(base, chunkBytes = 64 * 1024) {
       while (offset < size) {
         const len = Math.min(chunkBytes, size - offset);
         const url = `${base}/api/v1/file?path=${encodeURIComponent(filePath)}&offset=${offset}&len=${len}`;
-        const resp = await fetch(url, { headers: { "x-lan-sync-token": TOKEN } });
+        const resp = await fetch(url, {
+          headers: { "x-lan-sync-token": TOKEN, "x-lan-sync-session": sessionId },
+        });
         assert.equal(resp.status, 200, `下载 ${filePath}@${offset}`);
         const buf = Buffer.from(await resp.arrayBuffer());
         assert.equal(buf.length, len);
@@ -110,12 +112,13 @@ function makeDownloader(base, chunkBytes = 64 * 1024) {
   };
 }
 
-function makeUploader(base) {
+function makeUploader(base, sessionId) {
+  const baseHeaders = { "x-lan-sync-token": TOKEN, "x-lan-sync-session": sessionId };
   return {
     async initUpload(filePath, size, sha256) {
       const resp = await fetch(`${base}/api/v1/upload/init`, {
         method: "POST",
-        headers: { "x-lan-sync-token": TOKEN, "content-type": "application/json" },
+        headers: { ...baseHeaders, "content-type": "application/json" },
         body: JSON.stringify({ path: filePath, size, sha256 }),
       });
       assert.equal(resp.status, 200);
@@ -125,7 +128,7 @@ function makeUploader(base) {
     async uploadChunk(uploadId, offset, chunk) {
       const resp = await fetch(`${base}/api/v1/upload/chunk?uploadId=${uploadId}&offset=${offset}`, {
         method: "POST",
-        headers: { "x-lan-sync-token": TOKEN },
+        headers: baseHeaders,
         body: Buffer.from(chunk),
       });
       assert.equal(resp.status, 200);
@@ -133,7 +136,7 @@ function makeUploader(base) {
     async finishUpload(uploadId) {
       const resp = await fetch(`${base}/api/v1/upload/finish?uploadId=${uploadId}`, {
         method: "POST",
-        headers: { "x-lan-sync-token": TOKEN },
+        headers: baseHeaders,
       });
       assert.equal(resp.status, 200);
       const body = await resp.json();
@@ -142,7 +145,7 @@ function makeUploader(base) {
     async deleteRemote(filePath) {
       const resp = await fetch(`${base}/api/v1/file?path=${encodeURIComponent(filePath)}`, {
         method: "DELETE",
-        headers: { "x-lan-sync-token": TOKEN },
+        headers: baseHeaders,
       });
       assert.equal(resp.status, 200);
     },
@@ -150,31 +153,44 @@ function makeUploader(base) {
 }
 
 async function syncOnce(serverBase, localRoot, baselinePath = `${localRoot}.baseline.json`, mode = "pull") {
-  const adapter = createNodeAdapter(localRoot);
-  const local = await buildManifest(adapter, { ignore: IGNORE });
-  const resp = await fetch(`${serverBase}/api/v1/manifest`, {
+  const startResp = await fetch(`${serverBase}/api/v1/session/start`, {
+    method: "POST",
     headers: { "x-lan-sync-token": TOKEN },
   });
-  assert.equal(resp.status, 200);
-  const remote = await resp.json();
-  const baseline = fs.existsSync(baselinePath)
-    ? JSON.parse(fs.readFileSync(baselinePath, "utf8"))
-    : emptyBaseline();
-  const plan = planSync(local.entries, remote.entries, baseline, { mode });
-  let result;
-  if (mode === "push") {
-    result = await applyPushPlan(adapter, makeUploader(serverBase), plan, baseline, {
-      remoteEntries: remote.entries,
-      chunkBytes: 64 * 1024,
-    });
-  } else {
-    result = await applyPullPlan(adapter, makeDownloader(serverBase), plan, baseline, {
-      tmpDir: ".obsidian/plugins/lan-sync/tmp",
-      remoteEntries: remote.entries,
+  assert.equal(startResp.status, 200, "应能建立同步会话");
+  const { sessionId } = await startResp.json();
+  const sessionHeaders = { "x-lan-sync-token": TOKEN, "x-lan-sync-session": sessionId };
+
+  try {
+    const adapter = createNodeAdapter(localRoot);
+    const local = await buildManifest(adapter, { ignore: IGNORE });
+    const resp = await fetch(`${serverBase}/api/v1/manifest`, { headers: sessionHeaders });
+    assert.equal(resp.status, 200);
+    const remote = await resp.json();
+    const baseline = fs.existsSync(baselinePath)
+      ? JSON.parse(fs.readFileSync(baselinePath, "utf8"))
+      : emptyBaseline();
+    const plan = planSync(local.entries, remote.entries, baseline, { mode });
+    let result;
+    if (mode === "push") {
+      result = await applyPushPlan(adapter, makeUploader(serverBase, sessionId), plan, baseline, {
+        remoteEntries: remote.entries,
+        chunkBytes: 64 * 1024,
+      });
+    } else {
+      result = await applyPullPlan(adapter, makeDownloader(serverBase, sessionId), plan, baseline, {
+        tmpDir: ".obsidian/plugins/lan-sync/tmp",
+        remoteEntries: remote.entries,
+      });
+    }
+    fs.writeFileSync(baselinePath, JSON.stringify(result.newBaseline));
+    return { plan, result };
+  } finally {
+    await fetch(`${serverBase}/api/v1/session/end?sessionId=${sessionId}`, {
+      method: "POST",
+      headers: sessionHeaders,
     });
   }
-  fs.writeFileSync(baselinePath, JSON.stringify(result.newBaseline));
-  return { plan, result };
 }
 
 async function pullOnce(serverBase, localRoot, baselinePath = `${localRoot}.baseline.json`) {

@@ -30,6 +30,9 @@ test("忽略规则：git/trash/工作区/本插件自身", () => {
     ".obsidian/plugins/lan-sync/main.js",
     ".obsidian/plugins/lan-sync/data.json",
     ".obsidian/plugins/lan-sync/tmp/x.part",
+    ".obsidian/plugins/nutstore-sync/data.json",
+    ".obsidian/plugins/obsidian-git/data.json",
+    ".obsidian/plugins/obsidian-git/obsidian_askpass.sh",
   ];
   for (const path of ignored) {
     assert.equal(isIgnored(path, IGNORE), true, `应忽略：${path}`);
@@ -43,11 +46,19 @@ test("忽略规则：正常笔记与其它插件不被误伤", () => {
     "Assets/图片.png",
     ".obsidian/app.json",
     ".obsidian/plugins/obsidian-git/main.js",
+    ".obsidian/plugins/obsidian-git/manifest.json",
     "notes/.git.md",
   ];
   for (const path of kept) {
     assert.equal(isIgnored(path, IGNORE), false, `不应忽略：${path}`);
   }
+});
+
+test("忽略规则：显式开启后才同步插件 data.json", () => {
+  const cfg = { ...IGNORE, syncPluginData: true };
+  assert.equal(isIgnored(".obsidian/plugins/nutstore-sync/data.json", cfg), false);
+  assert.equal(isIgnored(".obsidian/plugins/lan-sync/data.json", cfg), true, "本插件自身永远不同步");
+  assert.equal(isIgnored(".obsidian/plugins/obsidian-git/obsidian_askpass.sh", cfg), true);
 });
 
 test("忽略规则：自定义 glob", () => {
