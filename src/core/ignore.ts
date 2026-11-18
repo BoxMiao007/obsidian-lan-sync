@@ -6,7 +6,7 @@
 export interface IgnoreConfig {
   /** Obsidian 配置目录，通常 ".obsidian"，用户可自定义 */
   configDir: string;
-  /** 本插件 id；传入后整个插件目录都不参与同步（含 data.json 里的配对码） */
+  /** 本插件 id；用于识别自身目录下哪些文件不能同步 */
   selfPluginId?: string;
   /** 额外忽略模式，支持 ** / * / ? */
   extraPatterns?: string[];
@@ -16,6 +16,12 @@ export interface IgnoreConfig {
    * 明文 HTTP 传出去等于裸奔。
    */
   syncPluginData?: boolean;
+  /**
+   * 是否同步本插件的程序文件（main.js / manifest.json / styles.css）。
+   * 默认 true：这样电脑上更新插件后，手机能自动跟上，不用每次手动拷。
+   * 注意：本插件的 data.json / baseline.json / tmp/ 永远不同步。
+   */
+  syncSelfCode?: boolean;
 }
 
 /** 统一成 POSIX 风格相对路径：反斜杠转正斜杠、去掉前导 ./ 和 / */
@@ -53,10 +59,17 @@ export function isIgnored(path: string, config: IgnoreConfig): boolean {
   if (normalized === `${configDir}/workspace.json`) return true;
   if (normalized === `${configDir}/workspace-mobile.json`) return true;
 
-  // 本插件自身目录：data.json 里是配对码，tmp/ 里是传输中间文件
+  // 本插件自身目录：只放行程序文件，其余（配对码、基线、临时文件）一律不同步。
+  // 配对码两端必须不同、基线每端独立、tmp 是传输中间产物，同步它们必然互相破坏。
   if (config.selfPluginId) {
     const selfDir = `${configDir}/plugins/${config.selfPluginId}`;
-    if (normalized === selfDir || normalized.startsWith(`${selfDir}/`)) return true;
+    if (normalized === selfDir || normalized.startsWith(`${selfDir}/`)) {
+      // 未显式关闭即视为开启（与设置项默认值一致）
+      if (config.syncSelfCode === false) return true;
+      const relative = normalized.slice(selfDir.length + 1);
+      // 只允许顶层三件套，且不允许子孙目录（tmp/、backup/ 等）
+      return !SELF_CODE_FILES.has(relative);
+    }
   }
 
   // 插件设置文件默认不同步：里面常有第三方服务凭据
@@ -78,6 +91,9 @@ export function filterIgnored<T extends { path: string }>(entries: T[], config: 
 }
 
 const globCache = new Map<string, RegExp>();
+
+/** 本插件唯一允许参与同步的文件：程序三件套。 */
+const SELF_CODE_FILES = new Set(["main.js", "manifest.json", "styles.css"]);
 
 function isPluginDataFile(path: string, configDir: string): boolean {
   const prefix = `${configDir}/plugins/`;

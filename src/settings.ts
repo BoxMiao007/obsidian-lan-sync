@@ -33,6 +33,8 @@ export interface LanSyncSettings {
   syncPluginData: boolean;
   /** 首次同步时两边都有但内容不同怎么办 */
   firstSyncStrategy: "conflict" | "prefer-remote" | "prefer-local";
+  /** 是否同步本插件的程序文件，让两端插件版本自动一致 */
+  syncSelfCode: boolean;
 }
 
 export const DEFAULT_SETTINGS: LanSyncSettings = {
@@ -51,6 +53,7 @@ export const DEFAULT_SETTINGS: LanSyncSettings = {
   syncIntervalMinutes: 0,
   syncPluginData: false,
   firstSyncStrategy: "conflict",
+  syncSelfCode: true,
 };
 
 export class LanSyncSettingTab extends PluginSettingTab {
@@ -408,6 +411,18 @@ export class LanSyncSettingTab extends PluginSettingTab {
               | "prefer-local";
             await this.plugin.saveSettings();
           })
+      );
+
+    new Setting(card)
+      .setName("同步本插件程序文件")
+      .setDesc(
+        "默认开启：把 main.js / manifest.json / styles.css 一起同步，电脑上更新插件后手机自动跟上（拉取后需重启 Obsidian 生效）。data.json（配对码）、基线、临时文件永远不同步。"
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.syncSelfCode).onChange(async (value) => {
+          this.plugin.settings.syncSelfCode = value;
+          await this.plugin.saveSettings();
+        })
       );
 
     new Setting(card)

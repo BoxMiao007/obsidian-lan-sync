@@ -81,6 +81,15 @@ http://192.168.x.x:28900/?token=123456
 - 总开关、打开 app 自动同步、文件变更后自动同步（秒，0=关）、定时同步（分钟，0=关）
 - 手机端只在 Obsidian 前台时有效，切后台会被系统冻结。
 
+## 同步入口在哪
+
+- **电脑端**：左侧边栏最下面有一个 ⇅ 图标（悬停提示「局域网同步」），状态栏右下角也有「⇅ 已同步」。
+- **手机端**：点左上角抽屉/侧边栏，底部就是同样的 ⇅ 图标。
+- 任意一端点它 = 立即同步；也可以在命令面板搜「立即同步」。
+
 ## 不会同步的内容
 
-`.git`、`.trash`、`workspace.json`、`workspace-mobile.json`、各插件的 `data.json`（含坚果云/GitHub 凭据）、本插件自身目录。
+`.git`、`.trash`、`workspace.json`、`workspace-mobile.json`、各插件的 `data.json`（含坚果云/GitHub 凭据）。
+
+本插件自己的目录只同步 `main.js` / `manifest.json` / `styles.css`（这样电脑更新插件后手机能自动跟上，拉取后需重启 Obsidian）；
+`data.json`（配对码）、`baseline.json`（同步基线）、`tmp/`（传输中间文件）永不同步。

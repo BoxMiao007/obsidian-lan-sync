@@ -27,8 +27,8 @@ test("忽略规则：git/trash/工作区/本插件自身", () => {
     "desktop.ini",
     ".obsidian/workspace.json",
     ".obsidian/workspace-mobile.json",
-    ".obsidian/plugins/lan-sync/main.js",
     ".obsidian/plugins/lan-sync/data.json",
+    ".obsidian/plugins/lan-sync/baseline.json",
     ".obsidian/plugins/lan-sync/tmp/x.part",
     ".obsidian/plugins/nutstore-sync/data.json",
     ".obsidian/plugins/obsidian-git/data.json",
@@ -57,8 +57,28 @@ test("忽略规则：正常笔记与其它插件不被误伤", () => {
 test("忽略规则：显式开启后才同步插件 data.json", () => {
   const cfg = { ...IGNORE, syncPluginData: true };
   assert.equal(isIgnored(".obsidian/plugins/nutstore-sync/data.json", cfg), false);
-  assert.equal(isIgnored(".obsidian/plugins/lan-sync/data.json", cfg), true, "本插件自身永远不同步");
+  assert.equal(isIgnored(".obsidian/plugins/lan-sync/data.json", cfg), true, "本插件自身永远不同步配置");
   assert.equal(isIgnored(".obsidian/plugins/obsidian-git/obsidian_askpass.sh", cfg), true);
+});
+
+test("忽略规则：本插件程序文件可同步，但配置与临时文件不行", () => {
+  // 默认 syncSelfCode = true：插件三件套跟着同步，手机能自动更新
+  for (const name of ["main.js", "manifest.json", "styles.css"]) {
+    const path = `.obsidian/plugins/lan-sync/${name}`;
+    assert.equal(isIgnored(path, IGNORE), false, `${name} 应参与同步`);
+  }
+  // 配置、基线、临时目录永远不同步
+  for (const path of [
+    ".obsidian/plugins/lan-sync/data.json",
+    ".obsidian/plugins/lan-sync/baseline.json",
+    ".obsidian/plugins/lan-sync/tmp/selftest-1mb.bin",
+    ".obsidian/plugins/lan-sync/backup/x.json",
+  ]) {
+    assert.equal(isIgnored(path, IGNORE), true, `${path} 不应参与同步`);
+  }
+  // 关掉开关则整个目录都不同步
+  const cfg = { ...IGNORE, syncSelfCode: false };
+  assert.equal(isIgnored(".obsidian/plugins/lan-sync/main.js", cfg), true);
 });
 
 test("忽略规则：自定义 glob", () => {

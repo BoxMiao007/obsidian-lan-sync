@@ -37,14 +37,24 @@ export default class LanSyncPlugin extends Plugin {
   private applying = false;
   private lastSyncAt = 0;
   private debounceTimer: number | null = null;
+  private ribbonEl: HTMLElement | null = null;
+  private statusBarEl: HTMLElement | null = null;
+  private syncState: "idle" | "syncing" | "ok" | "error" = "idle";
+
   async onload(): Promise<void> {
     await this.loadSettings();
     this.settingsTab = new LanSyncSettingTab(this.app, this);
     this.addSettingTab(this.settingsTab);
 
-    this.addRibbonIcon("wifi", "局域网同步：网络自检", () => {
-      void this.runSelfTest();
+    // 侧栏主按钮：立即同步（手机端在左侧抽屉里）
+    this.ribbonEl = this.addRibbonIcon("refresh-cw", "局域网同步：立即同步", () => {
+      void this.runSync();
     });
+
+    this.statusBarEl = this.addStatusBarItem();
+    this.statusBarEl.addClass("lan-sync-status");
+    this.statusBarEl.addEventListener("click", () => void this.runSync());
+    this.updateStatusBar();
 
     this.addCommand({
       id: "network-self-test",
@@ -67,6 +77,7 @@ export default class LanSyncPlugin extends Plugin {
     this.addCommand({
       id: "sync-now",
       name: "立即同步（按设置的方向）",
+      icon: "refresh-cw",
       callback: () => void this.runSync(),
     });
 
@@ -84,6 +95,17 @@ export default class LanSyncPlugin extends Plugin {
 
   /** 注册自动同步触发器。改设置不需要重注册：处理器每次都读当前设置。 */
   private registerTriggers(): void {
+    // 回到前台时同步一次（手机端最可靠的触发时机）
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") return;
+      if (!this.settings.syncEnabled) return;
+      const gap = Date.now() - this.lastSyncAt;
+      if (gap < 60_000) return;
+      void this.runSync(true);
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    this.register(() => document.removeEventListener("visibilitychange", onVisibility));
+
     if (this.settings.syncOnOpen) {
       window.setTimeout(() => void this.runSync(true), 3000);
     }
@@ -154,6 +176,7 @@ export default class LanSyncPlugin extends Plugin {
       configDir: this.app.vault.configDir,
       selfPluginId: "lan-sync",
       syncPluginData: this.settings.syncPluginData,
+      syncSelfCode: this.settings.syncSelfCode,
     };
   }
 
@@ -297,6 +320,28 @@ export default class LanSyncPlugin extends Plugin {
     new ReportModal(this.app, report).open();
   }
 
+  /** 侧栏/状态栏状态：空闲、同步中、失败。手机端没有状态栏，靠 ribbon 提示。 */
+  updateStatusBar(state: "idle" | "syncing" | "ok" | "error" = "idle", detail = ""): void {
+    this.syncState = state;
+    let label: string;
+    if (state === "syncing") label = "同步中…";
+    else if (state === "error") label = `同步失败${detail ? `：${detail}` : ""}`;
+    else if (state === "ok") label = "已同步";
+    else if (this.lastSyncAt) label = `上次同步 ${new Date(this.lastSyncAt).toLocaleTimeString("zh-CN", { hour12: false })}`;
+    else label = "尚未同步";
+
+    if (this.statusBarEl) {
+      this.statusBarEl.setText(`⇅ ${label}`);
+      this.statusBarEl.toggleClass("lan-sync-status--error", state === "error");
+      this.statusBarEl.toggleClass("lan-sync-status--busy", state === "syncing");
+    }
+    if (this.ribbonEl) {
+      this.ribbonEl.setAttribute("aria-label", `局域网同步：${label}（点击立即同步）`);
+      this.ribbonEl.toggleClass("lan-sync-ribbon--busy", state === "syncing");
+      this.ribbonEl.toggleClass("lan-sync-ribbon--error", state === "error");
+    }
+  }
+
   async runSync(auto = false): Promise<void> {
     if (this.syncRunning) {
       new Notice("同步正在进行，请稍候…");
@@ -312,6 +357,7 @@ export default class LanSyncPlugin extends Plugin {
     }
 
     this.syncRunning = true;
+    this.updateStatusBar("syncing");
     const notice = new Notice("正在扫描本机文件…", 0);
     let remote: HttpRemote | null = null;
     try {
@@ -355,6 +401,7 @@ export default class LanSyncPlugin extends Plugin {
       const hasWork =
         plan.downloads.length + plan.uploads.length + plan.deleteLocal.length + plan.deleteRemote.length > 0;
       if (!hasWork) {
+        this.updateStatusBar("ok");
         if (!auto) new ReportModal(this.app, "没有需要同步的改动（两端一致）。").open();
         return;
       }
@@ -376,11 +423,14 @@ export default class LanSyncPlugin extends Plugin {
       }).open();
     } catch (err) {
       notice.hide();
+      this.updateStatusBar("error", errMsg(err));
       new ReportModal(this.app, `同步失败：${errMsg(err)}`).open();
     } finally {
       if (remote) await remote.endSession();
       this.syncRunning = false;
       this.lastSyncAt = Date.now();
+      // 如果还没进入写入阶段（比如只是预览），把状态回落；错误状态保留
+      if (this.syncState === "syncing") this.updateStatusBar("idle");
     }
   }
 
@@ -422,6 +472,7 @@ export default class LanSyncPlugin extends Plugin {
       let uploaded = 0;
       let uploadedBytes = 0;
       let deletedRemote = 0;
+      let downloadedItems: Array<{ path: string }> = [];
       const errors: Array<{ path: string; message: string }> = [];
 
       if (this.settings.syncMode !== "push") {
@@ -434,6 +485,7 @@ export default class LanSyncPlugin extends Plugin {
         downloaded = pull.appliedDownloads.length;
         downloadedBytes = pull.bytes;
         deletedLocal = pull.appliedDeletes.length;
+        downloadedItems = pull.appliedDownloads;
         errors.push(...pull.errors);
       }
 
@@ -452,6 +504,11 @@ export default class LanSyncPlugin extends Plugin {
 
       await this.saveBaseline(current);
       progress.hide();
+
+      const selfDir = `${this.pluginDir()}/`;
+      const selfUpdated =
+        this.settings.syncSelfCode &&
+        downloadedItems.some((item) => item.path.startsWith(selfDir));
 
       const lines = [
         "LAN Sync · 同步结果",
@@ -472,6 +529,10 @@ export default class LanSyncPlugin extends Plugin {
       this.log(
         `同步完成：拉取 ${downloaded}，推送 ${uploaded}，错误 ${errors.length}`
       );
+      this.updateStatusBar(errors.length ? "error" : "ok", errors.length ? `${errors.length} 个文件失败` : "");
+      if (selfUpdated) {
+        lines.push("", "⚠ 本插件的程序文件已更新，需要重启 Obsidian（或在插件列表里关闭再启用）才会生效。");
+      }
       if (plan.conflicts.length) {
         new ConflictModal(this.app, this, plan.conflicts, lines).open();
       } else {
@@ -479,6 +540,7 @@ export default class LanSyncPlugin extends Plugin {
       }
     } catch (err) {
       progress.hide();
+      this.updateStatusBar("error", errMsg(err));
       new ReportModal(this.app, `同步中断：${errMsg(err)}`).open();
     } finally {
       this.applying = false;
