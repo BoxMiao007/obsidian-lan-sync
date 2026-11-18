@@ -7,7 +7,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { createSyncServer, buildManifest, planSync, applyPullPlan, emptyBaseline } = (() => {
+const { createSyncServer, buildManifest, planSync, applyPullPlan, applyPushPlan, emptyBaseline } = (() => {
   const server = require("../dist/server.cjs");
   const core = require("../dist/core.cjs");
   return { ...server, ...core };
@@ -110,7 +110,46 @@ function makeDownloader(base, chunkBytes = 64 * 1024) {
   };
 }
 
-async function pullOnce(serverBase, localRoot) {
+function makeUploader(base) {
+  return {
+    async initUpload(filePath, size, sha256) {
+      const resp = await fetch(`${base}/api/v1/upload/init`, {
+        method: "POST",
+        headers: { "x-lan-sync-token": TOKEN, "content-type": "application/json" },
+        body: JSON.stringify({ path: filePath, size, sha256 }),
+      });
+      assert.equal(resp.status, 200);
+      const body = await resp.json();
+      return body.uploadId;
+    },
+    async uploadChunk(uploadId, offset, chunk) {
+      const resp = await fetch(`${base}/api/v1/upload/chunk?uploadId=${uploadId}&offset=${offset}`, {
+        method: "POST",
+        headers: { "x-lan-sync-token": TOKEN },
+        body: Buffer.from(chunk),
+      });
+      assert.equal(resp.status, 200);
+    },
+    async finishUpload(uploadId) {
+      const resp = await fetch(`${base}/api/v1/upload/finish?uploadId=${uploadId}`, {
+        method: "POST",
+        headers: { "x-lan-sync-token": TOKEN },
+      });
+      assert.equal(resp.status, 200);
+      const body = await resp.json();
+      return { size: body.entry.size, sha256: body.entry.sha256 };
+    },
+    async deleteRemote(filePath) {
+      const resp = await fetch(`${base}/api/v1/file?path=${encodeURIComponent(filePath)}`, {
+        method: "DELETE",
+        headers: { "x-lan-sync-token": TOKEN },
+      });
+      assert.equal(resp.status, 200);
+    },
+  };
+}
+
+async function syncOnce(serverBase, localRoot, baselinePath = `${localRoot}.baseline.json`, mode = "pull") {
   const adapter = createNodeAdapter(localRoot);
   const local = await buildManifest(adapter, { ignore: IGNORE });
   const resp = await fetch(`${serverBase}/api/v1/manifest`, {
@@ -118,17 +157,28 @@ async function pullOnce(serverBase, localRoot) {
   });
   assert.equal(resp.status, 200);
   const remote = await resp.json();
-  const baselinePath = path.join(localRoot, ".baseline.json");
   const baseline = fs.existsSync(baselinePath)
     ? JSON.parse(fs.readFileSync(baselinePath, "utf8"))
     : emptyBaseline();
-  const plan = planSync(local.entries, remote.entries, baseline, { mode: "pull" });
-  const result = await applyPullPlan(adapter, makeDownloader(serverBase), plan, baseline, {
-    tmpDir: ".obsidian/plugins/lan-sync/tmp",
-    remoteEntries: remote.entries,
-  });
+  const plan = planSync(local.entries, remote.entries, baseline, { mode });
+  let result;
+  if (mode === "push") {
+    result = await applyPushPlan(adapter, makeUploader(serverBase), plan, baseline, {
+      remoteEntries: remote.entries,
+      chunkBytes: 64 * 1024,
+    });
+  } else {
+    result = await applyPullPlan(adapter, makeDownloader(serverBase), plan, baseline, {
+      tmpDir: ".obsidian/plugins/lan-sync/tmp",
+      remoteEntries: remote.entries,
+    });
+  }
   fs.writeFileSync(baselinePath, JSON.stringify(result.newBaseline));
   return { plan, result };
+}
+
+async function pullOnce(serverBase, localRoot, baselinePath = `${localRoot}.baseline.json`) {
+  return syncOnce(serverBase, localRoot, baselinePath, "pull");
 }
 
 test("端到端：首次拉取建立镜像，忽略项不进清单", async () => {
@@ -245,8 +295,7 @@ test("端到端：大批量删除触发熔断，一个文件都不动", async ()
   }
 });
 
-test("端到端：本机改动不会被 pull 覆盖", async () => {
-  const remoteRoot = makeTempDir("lan-remote4-");
+test("端到端：本机改动不会被 pull 覆盖", async () => {  const remoteRoot = makeTempDir("lan-remote4-");
   const localRoot = makeTempDir("lan-local4-");
   writeFile(remoteRoot, "a.md", "remote v1", 1700000000);
 
@@ -269,6 +318,43 @@ test("端到端：本机改动不会被 pull 覆盖", async () => {
     assert.ok(plan.skipped.some((s) => s.path === "a.md"));
     assert.equal(fs.readFileSync(path.join(localRoot, "a.md"), "utf8"), "local edit");
     assert.equal(result.bytes, 0);
+  } finally {
+    await handle.close();
+  }
+});
+
+test("端到端：push 把本机修改/新增/删除推到电脑", async () => {
+  const remoteRoot = makeTempDir("lan-remote5-");
+  const localRoot = makeTempDir("lan-local5-");
+  writeFile(remoteRoot, "a.md", "v1", 1700000000);
+  writeFile(remoteRoot, "b.md", "v1", 1700000000);
+  writeFile(remoteRoot, "c.md", "v1", 1700000000);
+
+  const handle = await createSyncServer({
+    port: 39304,
+    token: TOKEN,
+    uploadDir: path.join(remoteRoot, ".tmp-upload"),
+    vaultDir: remoteRoot,
+    ignore: IGNORE,
+    log: () => {},
+  });
+
+  try {
+    const base = `http://127.0.0.1:${handle.port}`;
+    await pullOnce(base, localRoot);
+
+    writeFile(localRoot, "a.md", "v2 local", 1700000300);
+    writeFile(localRoot, "new.md", "brand new", 1700000300);
+    fs.rmSync(path.join(localRoot, "c.md"));
+
+    const { plan, result } = await syncOnce(base, localRoot, undefined, "push");
+    assert.deepEqual(plan.uploads.map((u) => u.path).sort(), ["a.md", "new.md"]);
+    assert.deepEqual(plan.deleteRemote, ["c.md"]);
+    assert.equal(result.errors.length, 0, JSON.stringify(result.errors));
+    assert.equal(fs.readFileSync(path.join(remoteRoot, "a.md"), "utf8"), "v2 local");
+    assert.equal(fs.readFileSync(path.join(remoteRoot, "new.md"), "utf8"), "brand new");
+    assert.equal(fs.existsSync(path.join(remoteRoot, "c.md")), false);
+    assert.equal(fs.readFileSync(path.join(localRoot, "b.md"), "utf8"), "v1");
   } finally {
     await handle.close();
   }

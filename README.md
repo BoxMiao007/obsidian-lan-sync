@@ -2,15 +2,17 @@
 
 同一 Wi-Fi 下在电脑与手机之间同步 Obsidian 库，不经过任何云服务。
 
-## 当前状态：v0.1（单向：电脑 → 手机）
+## 当前状态：v0.3（双向同步，可用）
 
 - ✅ 桌面端 HTTP 服务（Obsidian 开着时监听，默认端口 28900）
-- ✅ 手机端「从电脑同步到本机」：内容哈希基线 + 4MB 分块传输 + 原子落盘
+- ✅ 手机端与电脑端双向同步：内容哈希基线 + 4MB 分块传输 + 原子落盘
 - ✅ 忽略规则：`.git` / `.trash` / `workspace*.json` / 本插件自身目录
-- ✅ 删除传播 + 删除熔断（>20 个或 >30% 时中止）
+- ✅ 删除传播（双向）+ 删除熔断（>20 个或 >30% 时中止）
+- ✅ 冲突弹窗：逐条选「留电脑 / 留手机 / 两份都留」
 - ✅ 首次同步强制预览（干跑），覆盖/删除前自动备份到 `.trash/lan-sync-backup-*`
-- ✅ 单元测试 + 端到端测试（真实 HTTP + 真实文件系统）
-- ⏳ 待做：手机 → 电脑推送（v0.2）、双向 + 冲突弹窗（v0.3）、BRAT 发布
+- ✅ 自动同步开关：总开关 / 打开 app 同步 / 文件变更防抖 / 定时同步
+- ✅ 测试：core 16 项 + server 11 项 + e2e 5 项
+- ⏳ 待做：真机验证（手机端）、BRAT 发版（需要 GitHub 仓库）
 
 ## 架构约束（决定了它长什么样）
 
@@ -18,6 +20,12 @@
 - **电脑端 Obsidian 必须开着**：插件运行在 Obsidian 进程内，Obsidian 关闭则服务停止。
 - **大文件必须分块**：手机端 `readBinary`/`writeBinary`/`requestUrl` 都是整包缓冲，20–50MB 就可能 OOM 崩掉 Obsidian。
 - **明文 HTTP 只在安卓当前版本可用**：iOS 已被 ATS 封死；安卓属于过渡期机制，未来可能要切换自签 HTTPS。
+
+## 安装（BRAT）
+
+1. 把本仓库推到 GitHub（`.github/workflows/release.yml` 会在打 tag 时自动构建并挂出三个文件）。
+2. 手机端装 BRAT 插件 → Add Beta plugin → 填 `你的用户名/obsidian-lan-sync`。
+3. 或者手动：把 `main.js` / `manifest.json` / `styles.css` 放进 `<库>/.obsidian/plugins/lan-sync/`。
 
 ## 开发
 

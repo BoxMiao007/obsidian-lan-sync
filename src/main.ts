@@ -20,9 +20,9 @@ import {
 import { createSyncServer, type SyncServerHandle } from "./server";
 import { DEFAULT_SETTINGS, LanSyncSettingTab, type LanSyncSettings } from "./settings";
 import { buildManifest } from "./core/manifest";
-import { planSync, summarizePlan, type SyncPlan } from "./core/plan";
+import { planSync, summarizePlan, type SyncPlan, type ConflictItem, type ChangeItem } from "./core/plan";
 import { emptyBaseline, type Baseline, type FileEntry } from "./core/types";
-import { applyPullPlan } from "./core/engine";
+import { applyPullPlan, applyPushPlan } from "./core/engine";
 import { HttpRemote } from "./net/remote";
 import type { IgnoreConfig } from "./core/ignore";
 
@@ -33,7 +33,10 @@ export default class LanSyncPlugin extends Plugin {
   settingsTab: LanSyncSettingTab | null = null;
 
   private selfTestRunning = false;
-
+  private syncRunning = false;
+  private applying = false;
+  private lastSyncAt = 0;
+  private debounceTimer: number | null = null;
   async onload(): Promise<void> {
     await this.loadSettings();
     this.settingsTab = new LanSyncSettingTab(this.app, this);
@@ -62,9 +65,9 @@ export default class LanSyncPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "pull-from-desktop",
-      name: "从电脑同步到本机（v0.1）",
-      callback: () => void this.runPullSync(),
+      id: "sync-now",
+      name: "立即同步（按设置的方向）",
+      callback: () => void this.runSync(),
     });
 
     if (Platform.isDesktopApp && this.settings.autoStartServer) {
@@ -75,6 +78,40 @@ export default class LanSyncPlugin extends Plugin {
         new Notice(`局域网服务启动失败：${errMsg(err)}`);
       }
     }
+
+    this.registerTriggers();
+  }
+
+  /** 注册自动同步触发器。改设置不需要重注册：处理器每次都读当前设置。 */
+  private registerTriggers(): void {
+    if (this.settings.syncOnOpen) {
+      window.setTimeout(() => void this.runSync(true), 3000);
+    }
+
+    const onVaultChange = () => {
+      if (!this.settings.syncEnabled || this.settings.syncDebounceSeconds <= 0) return;
+      if (this.syncRunning || this.applying) return;
+      if (this.debounceTimer) window.clearTimeout(this.debounceTimer);
+      this.debounceTimer = window.setTimeout(() => {
+        this.debounceTimer = null;
+        void this.runSync(true);
+      }, this.settings.syncDebounceSeconds * 1000);
+    };
+
+    this.registerEvent(this.app.vault.on("modify", onVaultChange));
+    this.registerEvent(this.app.vault.on("create", onVaultChange));
+    this.registerEvent(this.app.vault.on("delete", onVaultChange));
+    this.registerEvent(this.app.vault.on("rename", onVaultChange));
+
+    // 定时同步：每分钟检查一次，避免频繁重建 timer
+    this.registerInterval(
+      window.setInterval(() => {
+        if (!this.settings.syncEnabled || this.settings.syncIntervalMinutes <= 0) return;
+        if (this.syncRunning) return;
+        if (Date.now() - this.lastSyncAt < this.settings.syncIntervalMinutes * 60_000) return;
+        void this.runSync(true);
+      }, 60_000)
+    );
   }
 
   async onunload(): Promise<void> {
@@ -256,10 +293,7 @@ export default class LanSyncPlugin extends Plugin {
     new ReportModal(this.app, report).open();
   }
 
-  private syncRunning = false;
-
-  async runPullSync(): Promise<void> {
-    if (this.syncRunning) {
+  async runSync(auto = false): Promise<void> {    if (this.syncRunning) {
       new Notice("同步正在进行，请稍候…");
       return;
     }
@@ -267,7 +301,8 @@ export default class LanSyncPlugin extends Plugin {
     try {
       target = this.resolveTarget();
     } catch (err) {
-      new Notice(errMsg(err));
+      if (auto) this.log(`自动同步跳过：${errMsg(err)}`);
+      else new Notice(errMsg(err));
       return;
     }
 
@@ -289,31 +324,48 @@ export default class LanSyncPlugin extends Plugin {
       const remoteManifest = await remote.fetchManifest();
       const baseline = await this.loadBaseline();
       const plan = planSync(local.entries, remoteManifest.entries, baseline, {
-        mode: "pull",
+        mode: this.settings.syncMode,
         maxDeletes: this.settings.maxDeletes,
       });
       notice.hide();
 
       this.log(
-        `同步预览：本机 ${local.entries.length} / 电脑 ${remoteManifest.entries.length} → ${summarizePlan(plan)}`
+        `同步预览（${this.settings.syncMode}）：本机 ${local.entries.length} / 电脑 ${remoteManifest.entries.length} → ${summarizePlan(plan)}`
       );
+
+      const hasWork =
+        plan.downloads.length + plan.uploads.length + plan.deleteLocal.length + plan.deleteRemote.length > 0;
+      const mustPreview =
+        !auto || baseline.updatedAt === 0 || Boolean(plan.breaker) || plan.conflicts.length > 0;
+
+      if (!mustPreview && hasWork) {
+        // 自动同步：无人值守时不弹预览，直接应用（首次同步 / 冲突 / 熔断仍然会弹）
+        await this.applySync(plan, remote, remoteManifest.entries, baseline);
+        return;
+      }
+      if (!auto && !hasWork) {
+        new ReportModal(this.app, "没有需要同步的改动（两端一致）。").open();
+        return;
+      }
 
       new SyncPreviewModal(this.app, {
         plan,
         localCount: local.entries.length,
         remoteCount: remoteManifest.entries.length,
         firstSync: baseline.updatedAt === 0,
-        onConfirm: () => this.applyPull(plan, remote, remoteManifest.entries, baseline),
+        mode: this.settings.syncMode,
+        onConfirm: () => this.applySync(plan, remote, remoteManifest.entries, baseline),
       }).open();
     } catch (err) {
       notice.hide();
       new ReportModal(this.app, `同步失败：${errMsg(err)}`).open();
     } finally {
       this.syncRunning = false;
+      this.lastSyncAt = Date.now();
     }
   }
 
-  private async applyPull(
+  private async applySync(
     plan: SyncPlan,
     remote: HttpRemote,
     remoteEntries: FileEntry[],
@@ -322,8 +374,16 @@ export default class LanSyncPlugin extends Plugin {
     const adapter: any = this.app.vault.adapter;
     const progress = new Notice("开始同步…", 0);
     let lastTick = 0;
+    const tick = (label: string) => {
+      const now = Date.now();
+      if (now - lastTick > 300) {
+        lastTick = now;
+        progress.setMessage(label);
+      }
+    };
+
     try {
-      // 首次同步或覆盖/删除前，先把会被改动的文件备份到 .trash（同步忽略 .trash）
+      // 覆盖/删除本机文件之前先备份到 .trash（同步忽略 .trash）
       const backupTargets: string[] = [...plan.deleteLocal];
       for (const item of plan.downloads) {
         if (await adapter.exists(item.path)) backupTargets.push(item.path);
@@ -335,44 +395,121 @@ export default class LanSyncPlugin extends Plugin {
         backedUp = await this.backupFiles(backupTargets, `.trash/lan-sync-backup-${stamp}`);
       }
 
-      const result = await applyPullPlan(adapter, remote, plan, baseline, {
-        tmpDir: this.tempDir(),
-        remoteEntries,
-        onProgress: (info) => {
-          const now = Date.now();
-          if (now - lastTick > 300) {
-            lastTick = now;
-            progress.setMessage(`同步中 ${info.done}/${info.total}：${info.label}`);
-          }
-        },
-      });
-      await this.saveBaseline(result.newBaseline);
+      let current = baseline;
+      let downloaded = 0;
+      let downloadedBytes = 0;
+      let deletedLocal = 0;
+      let uploaded = 0;
+      let uploadedBytes = 0;
+      let deletedRemote = 0;
+      const errors: Array<{ path: string; message: string }> = [];
+
+      if (this.settings.syncMode !== "push") {
+        const pull = await applyPullPlan(adapter, remote, plan, current, {
+          tmpDir: this.tempDir(),
+          remoteEntries,
+          onProgress: (info) => tick(`拉取 ${info.done}/${info.total}：${info.label}`),
+        });
+        current = pull.newBaseline;
+        downloaded = pull.appliedDownloads.length;
+        downloadedBytes = pull.bytes;
+        deletedLocal = pull.appliedDeletes.length;
+        errors.push(...pull.errors);
+      }
+
+      if (this.settings.syncMode !== "pull") {
+        const push = await applyPushPlan(adapter, remote, plan, current, {
+          chunkBytes: Math.max(0.25, this.settings.chunkMB) * 1024 * 1024,
+          remoteEntries,
+          onProgress: (info) => tick(`推送 ${info.done}/${info.total}：${info.label}`),
+        });
+        current = push.newBaseline;
+        uploaded = push.appliedDownloads.length;
+        uploadedBytes = push.bytes;
+        deletedRemote = push.appliedDeletes.length;
+        errors.push(...push.errors);
+      }
+
+      await this.saveBaseline(current);
       progress.hide();
 
       const lines = [
         "LAN Sync · 同步结果",
-        `下载/更新：${result.appliedDownloads.length} 个（${formatBytes(result.bytes)}）`,
-        `删除本机：${result.appliedDeletes.length} 个`,
+        `拉取：${downloaded} 个（${formatBytes(downloadedBytes)}），删除本机 ${deletedLocal} 个`,
+        `推送：${uploaded} 个（${formatBytes(uploadedBytes)}），删除电脑 ${deletedRemote} 个`,
         `已备份：${backedUp} 个（.trash/lan-sync-backup-*）`,
         `冲突未处理：${plan.conflicts.length} 个`,
         `跳过：${plan.skipped.length} 个`,
       ];
-      if (result.errors.length) {
-        lines.push("", `失败 ${result.errors.length} 个：`);
-        for (const item of result.errors.slice(0, 20)) lines.push(`  ✗ ${item.path}：${item.message}`);
+      if (errors.length) {
+        lines.push("", `失败 ${errors.length} 个：`);
+        for (const item of errors.slice(0, 20)) lines.push(`  ✗ ${item.path}：${item.message}`);
       }
       if (plan.conflicts.length) {
         lines.push("", "冲突文件（两端都改过，本次保持原样）：");
         for (const item of plan.conflicts.slice(0, 20)) lines.push(`  ⚠ ${item.path}（${item.reason}）`);
       }
       this.log(
-        `同步完成：下载 ${result.appliedDownloads.length}，删除 ${result.appliedDeletes.length}，错误 ${result.errors.length}`
+        `同步完成：拉取 ${downloaded}，推送 ${uploaded}，错误 ${errors.length}`
       );
-      new ReportModal(this.app, lines.join("\n")).open();
+      if (plan.conflicts.length) {
+        new ConflictModal(this.app, this, plan.conflicts, lines).open();
+      } else {
+        new ReportModal(this.app, lines.join("\n")).open();
+      }
     } catch (err) {
       progress.hide();
       new ReportModal(this.app, `同步中断：${errMsg(err)}`).open();
     }
+  }
+
+  /** 冲突的三个处理方式：留电脑 / 留手机 / 两份都留。 */
+  async resolveConflict(conflict: ConflictItem, choice: "remote" | "local" | "both"): Promise<void> {
+    const target = this.resolveTarget();
+    const chunkBytes = Math.max(0.25, this.settings.chunkMB) * 1024 * 1024;
+    const remote = new HttpRemote(target.base, target.token, chunkBytes);
+    const adapter: any = this.app.vault.adapter;
+    const baseline = await this.loadBaseline();
+    const remoteItem: ChangeItem = {
+      path: conflict.path,
+      size: conflict.remoteSize,
+      sha256: conflict.remoteSha,
+      mtime: 0,
+    };
+    const localItem: ChangeItem = {
+      path: conflict.path,
+      size: conflict.localSize,
+      sha256: conflict.localSha,
+      mtime: 0,
+    };
+
+    if (choice === "remote") {
+      const result = await applyPullPlan(adapter, remote, singlePlan({ downloads: [remoteItem] }), baseline, {
+        tmpDir: this.tempDir(),
+        remoteEntries: [],
+      });
+      if (result.errors.length) throw new Error(result.errors[0].message);
+      await this.saveBaseline(result.newBaseline);
+    } else if (choice === "local") {
+      const result = await applyPushPlan(adapter, remote, singlePlan({ uploads: [localItem] }), baseline, {
+        chunkBytes,
+        remoteEntries: [],
+      });
+      if (result.errors.length) throw new Error(result.errors[0].message);
+      await this.saveBaseline(result.newBaseline);
+    } else {
+      // 保留两份：先把本机版本复制成冲突副本，再用电脑版本覆盖原文件。
+      const data = await adapter.readBinary(conflict.path);
+      const copyPath = conflictCopyPath(conflict.path);
+      await adapter.writeBinary(copyPath, data);
+      const result = await applyPullPlan(adapter, remote, singlePlan({ downloads: [remoteItem] }), baseline, {
+        tmpDir: this.tempDir(),
+        remoteEntries: [],
+      });
+      if (result.errors.length) throw new Error(result.errors[0].message);
+      await this.saveBaseline(result.newBaseline);
+    }
+    this.log(`解决冲突：${conflict.path} → ${choice}`);
   }
 
   /** 覆盖/删除前把文件复制到 .trash，避免首次同步或误判造成不可逆损失。 */
@@ -485,6 +622,7 @@ interface SyncPreviewOptions {
   localCount: number;
   remoteCount: number;
   firstSync: boolean;
+  mode: "pull" | "push" | "both";
   onConfirm: () => Promise<void>;
 }
 
@@ -511,10 +649,14 @@ class SyncPreviewModal extends Modal {
     }
 
     const plan = this.options.plan;
-    const lines: string[] = [summarizePlan(plan), ""];
+    const modeLabel =
+      this.options.mode === "pull" ? "只拉取（电脑→本机）" : this.options.mode === "push" ? "只推送（本机→电脑）" : "双向";
+    const lines: string[] = [`方向：${modeLabel}`, summarizePlan(plan), ""];
     if (plan.breaker) lines.push(`⛔ ${plan.breaker.message}`, "");
     appendSection(lines, "将下载 / 覆盖本机", plan.downloads.map((d) => `${d.path}（${formatBytes(d.size)}）`));
+    appendSection(lines, "将上传到电脑", plan.uploads.map((u) => `${u.path}（${formatBytes(u.size)}）`));
     appendSection(lines, "将删除本机", plan.deleteLocal);
+    appendSection(lines, "将删除电脑上的文件", plan.deleteRemote);
     appendSection(lines, "冲突（本次不处理）", plan.conflicts.map((c) => `${c.path}（${c.reason}）`));
     appendSection(lines, "跳过", plan.skipped.map((s) => `${s.path}：${s.reason}`));
 
@@ -556,6 +698,103 @@ function appendSection(lines: string[], title: string, items: string[]): void {
   for (const item of items.slice(0, 30)) lines.push(`  ${item}`);
   if (items.length > 30) lines.push(`  …还有 ${items.length - 30} 项`);
   lines.push("");
+}
+
+function singlePlan(parts: {
+  downloads?: ChangeItem[];
+  uploads?: ChangeItem[];
+  deleteLocal?: string[];
+  deleteRemote?: string[];
+}): SyncPlan {
+  return {
+    downloads: parts.downloads ?? [],
+    uploads: parts.uploads ?? [],
+    deleteLocal: parts.deleteLocal ?? [],
+    deleteRemote: parts.deleteRemote ?? [],
+    conflicts: [],
+    skipped: [],
+    unchanged: 0,
+    unchangedPaths: [],
+    breaker: null,
+    totals: { localFiles: 0, remoteFiles: 0 },
+  };
+}
+
+function conflictCopyPath(path: string): string {
+  const slash = path.lastIndexOf("/");
+  const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
+  const file = slash >= 0 ? path.slice(slash + 1) : path;
+  const dot = file.lastIndexOf(".");
+  const base = dot > 0 ? file.slice(0, dot) : file;
+  const ext = dot > 0 ? file.slice(dot) : "";
+  const device = Platform.isMobileApp ? "手机" : "电脑";
+  const stamp = new Date()
+    .toISOString()
+    .replace(/[:.]/g, "-")
+    .replace("T", "-")
+    .slice(0, 15);
+  return `${dir}${base}.conflict-${device}-${stamp}${ext}`;
+}
+
+class ConflictModal extends Modal {
+  private plugin: LanSyncPlugin;
+  private conflicts: ConflictItem[];
+  private summary: string[];
+
+  constructor(app: App, plugin: LanSyncPlugin, conflicts: ConflictItem[], summary: string[]) {
+    super(app);
+    this.plugin = plugin;
+    this.conflicts = conflicts;
+    this.summary = summary;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    this.setTitle("冲突处理");
+    contentEl.createEl("p", {
+      text: `有 ${this.conflicts.length} 个文件两端都改过。逐条选择保留哪个版本：`,
+    });
+
+    const pre = contentEl.createEl("pre", { cls: "lan-sync-report" });
+    pre.setText(this.summary.join("\n"));
+
+    const options: Array<[string, "remote" | "local" | "both"]> = [
+      ["留电脑版本", "remote"],
+      ["留手机版本", "local"],
+      ["两份都留", "both"],
+    ];
+
+    for (const conflict of this.conflicts) {
+      const row = contentEl.createDiv({ cls: "lan-sync-conflict" });
+      row.createEl("div", { cls: "lan-sync-conflict-path", text: conflict.path });
+      const buttons = row.createDiv({ cls: "lan-sync-modal-buttons" });
+      for (const [label, choice] of options) {
+        const button = buttons.createEl("button", { text: label });
+        button.addEventListener("click", async () => {
+          buttons.querySelectorAll("button").forEach((item) => {
+            (item as HTMLButtonElement).disabled = true;
+          });
+          const status = row.createEl("span", { cls: "lan-sync-muted", text: "处理中…" });
+          try {
+            await this.plugin.resolveConflict(conflict, choice);
+            status.setText("✓ 已处理");
+          } catch (err) {
+            status.setText(`失败：${errMsg(err)}`);
+            buttons.querySelectorAll("button").forEach((item) => {
+              (item as HTMLButtonElement).disabled = false;
+            });
+          }
+        });
+      }
+    }
+
+    const close = contentEl.createEl("button", { text: "关闭" });
+    close.addEventListener("click", () => this.close());
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
 }
 
 class ReportModal extends Modal {

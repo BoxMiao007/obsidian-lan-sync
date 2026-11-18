@@ -79,6 +79,74 @@ export class HttpRemote {
     }
     return { fileSha, bytes: offset };
   }
+
+  async initUpload(path: string, size: number, sha256: string | null): Promise<string> {
+    const resp = await withTimeout(
+      requestUrl({
+        url: `${this.base}/api/v1/upload/init`,
+        method: "POST",
+        headers: { ...this.headers(), "content-type": "application/json" },
+        body: JSON.stringify({ path, size, sha256 }),
+        throw: false,
+      }),
+      30000,
+      `上传初始化 ${path}`
+    );
+    if (resp.status !== 200 || !resp.json?.uploadId) {
+      throw new Error(`上传初始化失败：HTTP ${resp.status} ${resp.json?.error || ""}`.trim());
+    }
+    return resp.json.uploadId;
+  }
+
+  async uploadChunk(uploadId: string, offset: number, chunk: ArrayBuffer): Promise<void> {
+    const resp = await withTimeout(
+      requestUrl({
+        url: `${this.base}/api/v1/upload/chunk?uploadId=${uploadId}&offset=${offset}`,
+        method: "POST",
+        headers: { ...this.headers(), "content-type": "application/octet-stream" },
+        body: chunk,
+        throw: false,
+      }),
+      120000,
+      `上传分块 ${offset}`
+    );
+    if (resp.status !== 200) {
+      throw new Error(`上传分块失败：HTTP ${resp.status} ${resp.json?.error || ""}`.trim());
+    }
+  }
+
+  async finishUpload(uploadId: string): Promise<{ size: number; sha256: string | null }> {
+    const resp = await withTimeout(
+      requestUrl({
+        url: `${this.base}/api/v1/upload/finish?uploadId=${uploadId}`,
+        method: "POST",
+        headers: this.headers(),
+        throw: false,
+      }),
+      120000,
+      "上传收尾"
+    );
+    if (resp.status !== 200) {
+      throw new Error(`上传收尾失败：HTTP ${resp.status} ${resp.json?.error || ""}`.trim());
+    }
+    return { size: resp.json?.entry?.size ?? -1, sha256: resp.json?.entry?.sha256 ?? null };
+  }
+
+  async deleteRemote(path: string): Promise<void> {
+    const resp = await withTimeout(
+      requestUrl({
+        url: `${this.base}/api/v1/file?path=${encodeURIComponent(path)}`,
+        method: "DELETE",
+        headers: this.headers(),
+        throw: false,
+      }),
+      30000,
+      `删除远端 ${path}`
+    );
+    if (resp.status !== 200) {
+      throw new Error(`删除远端失败：HTTP ${resp.status} ${resp.json?.error || ""}`.trim());
+    }
+  }
 }
 
 export function joinUrl(base: string, path: string): string {

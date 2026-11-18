@@ -5,6 +5,7 @@
 import type { ManifestAdapter } from "./manifest";
 import type { Baseline, FileEntry } from "./types";
 import { updateBaseline, type ChangeItem, type SyncPlan } from "./plan";
+import { sha256Buffer } from "./hash";
 
 export interface EngineAdapter extends ManifestAdapter {
   writeBinary(path: string, data: ArrayBuffer): Promise<void>;
@@ -20,6 +21,13 @@ export interface FileDownloader {
     size: number,
     onChunk: (meta: { chunk: ArrayBuffer; offset: number }) => Promise<void> | void
   ): Promise<{ fileSha: string | null; bytes: number }>;
+}
+
+export interface RemoteWriter {
+  initUpload(path: string, size: number, sha256: string | null): Promise<string>;
+  uploadChunk(uploadId: string, offset: number, chunk: ArrayBuffer): Promise<void>;
+  finishUpload(uploadId: string): Promise<{ size: number; sha256: string | null }>;
+  deleteRemote(path: string): Promise<void>;
 }
 
 export interface ApplyOptions {
@@ -131,8 +139,101 @@ export async function applyPullPlan(
   };
 }
 
-async function ensureDir(adapter: EngineAdapter, dir: string): Promise<void> {
-  if (!dir || dir === ".") return;
+export interface PushApplyOptions {
+  chunkBytes?: number;
+  remoteEntries: FileEntry[];
+  onProgress?: (info: { done: number; total: number; label: string; bytes: number }) => void;
+}
+
+/** 把本机的新增/修改推送到远端，并删除远端已被本机删除的文件。 */
+export async function applyPushPlan(
+  adapter: EngineAdapter,
+  remote: RemoteWriter,
+  plan: SyncPlan,
+  baseline: Baseline,
+  options: PushApplyOptions
+): Promise<ApplyResult> {
+  const errors: Array<{ path: string; message: string }> = [];
+  const appliedUploads: ChangeItem[] = [];
+  const appliedDeletes: string[] = [];
+
+  if (plan.breaker) {
+    return {
+      appliedDownloads: appliedUploads,
+      appliedDeletes,
+      errors: [{ path: "*", message: plan.breaker.message }],
+      bytes: 0,
+      newBaseline: baseline,
+    };
+  }
+
+  const chunkBytes = options.chunkBytes ?? 4 * 1024 * 1024;
+  const total = plan.uploads.length + plan.deleteRemote.length;
+  let done = 0;
+  let bytes = 0;
+
+  for (let i = 0; i < plan.uploads.length; i++) {
+    const item = plan.uploads[i];
+    try {
+      const buffer = await adapter.readBinary(item.path);
+      if (buffer.byteLength !== item.size) {
+        throw new Error(`文件在扫描后发生变化（${buffer.byteLength}/${item.size}），请重新同步`);
+      }
+      const sha = item.sha256 ?? (await sha256Buffer(buffer));
+      if (item.sha256 && sha && item.sha256 !== sha) {
+        throw new Error("本地文件在扫描后发生变化，请重新同步");
+      }
+
+      const uploadId = await remote.initUpload(item.path, item.size, sha);
+      for (let offset = 0; offset < item.size; offset += chunkBytes) {
+        const len = Math.min(chunkBytes, item.size - offset);
+        const chunk = buffer.slice(offset, offset + len);
+        await remote.uploadChunk(uploadId, offset, chunk);
+        options.onProgress?.({ done, total, label: `${item.path}@${offset}`, bytes });
+      }
+      const finished = await remote.finishUpload(uploadId);
+      if (finished.size !== item.size) {
+        throw new Error(`服务端大小不符：${finished.size}/${item.size}`);
+      }
+      if (sha && finished.sha256 && sha !== finished.sha256) {
+        throw new Error("服务端内容哈希不一致");
+      }
+      bytes += item.size;
+      appliedUploads.push({ ...item, sha256: sha });
+    } catch (err: any) {
+      errors.push({ path: item.path, message: String((err && err.message) || err) });
+    } finally {
+      done++;
+      options.onProgress?.({ done, total, label: item.path, bytes });
+    }
+  }
+
+  for (const path of plan.deleteRemote) {
+    try {
+      await remote.deleteRemote(path);
+      appliedDeletes.push(path);
+    } catch (err: any) {
+      errors.push({ path, message: String((err && err.message) || err) });
+    } finally {
+      done++;
+      options.onProgress?.({ done, total, label: `删除远端 ${path}`, bytes });
+    }
+  }
+
+  const unchangedRemote = options.remoteEntries.filter((entry) =>
+    plan.unchangedPaths.includes(entry.path)
+  );
+
+  return {
+    appliedDownloads: appliedUploads,
+    appliedDeletes,
+    errors,
+    bytes,
+    newBaseline: updateBaseline(baseline, appliedUploads, appliedDeletes, unchangedRemote),
+  };
+}
+
+async function ensureDir(adapter: EngineAdapter, dir: string): Promise<void> {  if (!dir || dir === ".") return;
   const parts = dir.split("/");
   let current = "";
   for (const part of parts) {

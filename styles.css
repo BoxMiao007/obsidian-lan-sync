@@ -59,3 +59,15 @@
   justify-content: flex-end;
   margin-top: 12px;
 }
+
+.lan-sync-conflict {
+  border-top: 1px solid var(--background-modifier-border);
+  padding: 10px 0;
+}
+
+.lan-sync-conflict-path {
+  font-family: var(--font-monospace);
+  font-size: 0.85em;
+  word-break: break-all;
+  margin-bottom: 6px;
+}

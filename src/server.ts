@@ -64,6 +64,7 @@ export async function createSyncServer(opts: SyncServerOptions): Promise<SyncSer
 
   const log = opts.log ?? (() => {});
   const uploads = new Map<string, UploadState>();
+  const v1Uploads = new Map<string, { path: string; size: number; sha256: string | null; received: number }>();
   const blobCache = new Map<string, any>();
 
   const uploadRoot = path.join(opts.uploadDir, "spike-uploads");
@@ -187,7 +188,7 @@ export async function createSyncServer(opts: SyncServerOptions): Promise<SyncSer
 
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
     res.setHeader("Cache-Control", "no-store");
 
     const sendJson = (status: number, obj: any) => {
@@ -357,6 +358,97 @@ document.getElementById("test").addEventListener("click", async () => {
           res.setHeader("x-chunk-sha256", sha256(buffer));
           if (fileSha) res.setHeader("x-file-sha256", fileSha);
           res.end(buffer);
+          return;
+        }
+
+        // 手机 → 电脑上传：先写临时文件，校验通过后原子替换目标
+        if (pathname === "/api/v1/upload/init" && req.method === "POST") {
+          if (!opts.vaultDir) throw new Error("服务端未配置 vaultDir");
+          const body = await readBody(req, 64 * 1024);
+          const info = JSON.parse(body.toString("utf8") || "{}");
+          const rel = String(info.path || "").replace(/\\/g, "/");
+          if (!rel || rel.includes("..") || isIgnored(rel, ignoreConfig)) {
+            throw new Error("目标路径不合法");
+          }
+          const size = Number(info.size) || 0;
+          if (size < 0 || size > 128 * 1024 * 1024) throw new Error("文件大小不合法");
+          const id = crypto.randomBytes(8).toString("hex");
+          const tmpPath = path.join(uploadRoot, `v1-${id}.part`);
+          fs.writeFileSync(tmpPath, Buffer.alloc(0));
+          v1Uploads.set(id, {
+            path: rel,
+            size,
+            sha256: info.sha256 ? String(info.sha256) : null,
+            received: 0,
+          });
+          sendJson(200, { ok: true, uploadId: id });
+          return;
+        }
+
+        if (pathname === "/api/v1/upload/chunk" && req.method === "POST") {
+          const id = url.searchParams.get("uploadId") || "";
+          const state = v1Uploads.get(id);
+          if (!state) throw new Error("uploadId 不存在");
+          const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+          const body = await readBody(req, MAX_BODY_BYTES);
+          const tmpPath = path.join(uploadRoot, `v1-${id}.part`);
+          const fd = fs.openSync(tmpPath, "r+");
+          try {
+            fs.writeSync(fd, body, 0, body.length, offset);
+          } finally {
+            fs.closeSync(fd);
+          }
+          state.received += body.length;
+          sendJson(200, { ok: true, received: body.length, offset });
+          return;
+        }
+
+        if (pathname === "/api/v1/upload/finish" && req.method === "POST") {
+          if (!opts.vaultDir) throw new Error("服务端未配置 vaultDir");
+          const id = url.searchParams.get("uploadId") || "";
+          const state = v1Uploads.get(id);
+          if (!state) throw new Error("uploadId 不存在");
+          const tmpPath = path.join(uploadRoot, `v1-${id}.part`);
+          const data = fs.readFileSync(tmpPath);
+          if (data.length !== state.size) throw new Error(`上传大小不符：${data.length}/${state.size}`);
+          const digest = sha256(data);
+          if (state.sha256 && digest !== state.sha256) throw new Error("上传内容哈希不一致");
+          const abs = resolveVaultFile(state.path);
+          if (!abs) throw new Error("目标路径不合法");
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          const replaceTmp = path.join(uploadRoot, `v1-${id}.replace`);
+          fs.writeFileSync(replaceTmp, data);
+          try {
+            fs.rmSync(abs, { force: true });
+          } catch {
+            /* 目标不存在 */
+          }
+          fs.renameSync(replaceTmp, abs);
+          fs.rmSync(tmpPath, { force: true });
+          manifestCache.delete(state.path);
+          const stat = fs.statSync(abs);
+          v1Uploads.delete(id);
+          sendJson(200, {
+            ok: true,
+            entry: {
+              path: state.path,
+              size: stat.size,
+              mtime: Math.trunc(stat.mtimeMs || 0),
+              sha256: digest,
+            },
+          });
+          return;
+        }
+
+        if (pathname === "/api/v1/file" && req.method === "DELETE") {
+          if (!opts.vaultDir) throw new Error("服务端未配置 vaultDir");
+          const rel = url.searchParams.get("path") || "";
+          if (!rel || rel.includes("..") || isIgnored(rel, ignoreConfig)) throw new Error("路径不合法");
+          const abs = resolveVaultFile(rel);
+          if (!abs) throw new Error("路径不合法");
+          fs.rmSync(abs, { force: true });
+          manifestCache.delete(rel);
+          sendJson(200, { ok: true, path: rel });
           return;
         }
 

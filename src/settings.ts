@@ -19,6 +19,16 @@ export interface LanSyncSettings {
   chunkMB: number;
   /** 单次同步允许的最大删除数 */
   maxDeletes: number;
+  /** 同步方向 */
+  syncMode: "pull" | "push" | "both";
+  /** 自动同步总开关 */
+  syncEnabled: boolean;
+  /** 打开 app 时自动同步 */
+  syncOnOpen: boolean;
+  /** 文件变更后延迟多少秒自动同步，0 = 关闭 */
+  syncDebounceSeconds: number;
+  /** 定时同步间隔（分钟），0 = 关闭 */
+  syncIntervalMinutes: number;
 }
 
 export const DEFAULT_SETTINGS: LanSyncSettings = {
@@ -30,6 +40,11 @@ export const DEFAULT_SETTINGS: LanSyncSettings = {
   clientToken: "",
   chunkMB: 4,
   maxDeletes: 20,
+  syncMode: "pull",
+  syncEnabled: true,
+  syncOnOpen: true,
+  syncDebounceSeconds: 10,
+  syncIntervalMinutes: 0,
 };
 
 export class LanSyncSettingTab extends PluginSettingTab {
@@ -255,14 +270,31 @@ export class LanSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(card)
+      .setName("同步方向")
+      .setDesc("pull = 只把电脑改动拉到本机；push = 只把本机改动推到电脑；both = 双向（推荐最终使用）")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOptions({
+            pull: "只拉取（电脑 → 本机）",
+            push: "只推送（本机 → 电脑）",
+            both: "双向",
+          })
+          .setValue(this.plugin.settings.syncMode)
+          .onChange(async (value) => {
+            this.plugin.settings.syncMode = value as "pull" | "push" | "both";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(card)
       .setName("同步")
-      .setDesc("v0.1：只把电脑上的改动拉到本机；本机改动不会回传。")
+      .setDesc("先预览差异，确认后才写入。")
       .addButton((btn) =>
         btn
-          .setButtonText("从电脑同步到本机")
+          .setButtonText("立即同步")
           .setCta()
           .onClick(async () => {
-            await this.plugin.runPullSync();
+            await this.plugin.runSync();
           })
       );
 
@@ -293,6 +325,58 @@ export class LanSyncSettingTab extends PluginSettingTab {
             const parsed = parseInt(value, 10);
             if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 1000) {
               this.plugin.settings.maxDeletes = parsed;
+              await this.plugin.saveSettings();
+            }
+          })
+      );
+
+    new Setting(card)
+      .setName("自动同步总开关")
+      .setDesc("关闭后只有手动点「立即同步」才会同步。")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.syncEnabled).onChange(async (value) => {
+          this.plugin.settings.syncEnabled = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(card)
+      .setName("打开 app 时自动同步")
+      .setDesc("手机端每次打开 Obsidian 后自动拉一次（首次同步仍会先让你确认）。")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.syncOnOpen).onChange(async (value) => {
+          this.plugin.settings.syncOnOpen = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(card)
+      .setName("文件变更后自动同步")
+      .setDesc("编辑停止多少秒后自动同步；0 = 关闭。手机端仅在 Obsidian 处于前台时有效。")
+      .addText((text) =>
+        text
+          .setPlaceholder("10")
+          .setValue(String(this.plugin.settings.syncDebounceSeconds))
+          .onChange(async (value) => {
+            const parsed = parseInt(value, 10);
+            if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 600) {
+              this.plugin.settings.syncDebounceSeconds = parsed;
+              await this.plugin.saveSettings();
+            }
+          })
+      );
+
+    new Setting(card)
+      .setName("定时同步")
+      .setDesc("每隔多少分钟同步一次；0 = 关闭。")
+      .addText((text) =>
+        text
+          .setPlaceholder("0")
+          .setValue(String(this.plugin.settings.syncIntervalMinutes))
+          .onChange(async (value) => {
+            const parsed = parseInt(value, 10);
+            if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 1440) {
+              this.plugin.settings.syncIntervalMinutes = parsed;
               await this.plugin.saveSettings();
             }
           })
