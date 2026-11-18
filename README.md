@@ -27,6 +27,13 @@
 2. 手机端装 BRAT 插件 → Add Beta plugin → 填 `你的用户名/obsidian-lan-sync`。
 3. 或者手动：把 `main.js` / `manifest.json` / `styles.css` 放进 `<库>/.obsidian/plugins/lan-sync/`。
 
+## 安全边界
+
+- 只监听局域网，配对码错误一律 401；请求体带 `x-lan-sync-token`。
+- **明文 HTTP**：同 Wi-Fi 下可被抓包。因此默认**不同步**任何第三方插件的 `data.json`——本库的坚果云 WebDAV 凭据、obsidian-git 的 GitHub 令牌都在里面。设置里那个「同步第三方插件设置（危险）」开关默认关闭。
+- `.git`、`.trash`、`workspace*.json`、`*.askpass.sh` 和本插件自身目录永不同步。
+- 同一时刻只允许一个客户端同步（服务端会话锁，1 小时超时兜底）。
+
 ## 开发
 
 ```bash
