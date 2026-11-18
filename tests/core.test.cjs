@@ -217,7 +217,11 @@ test("manifest：递归扫描、跳过忽略项、超大文件不算哈希", asy
     "big.bin": "0123456789",
   };
   const adapter = makeMemoryAdapter(tree);
-  const manifest = await buildManifest(adapter, { ignore: IGNORE, maxHashBytes: 8 });
+  // 这里测「递归扫描 + 跳过忽略项」，把自身程序文件同步关掉，让 main.js 也被跳过
+  const manifest = await buildManifest(adapter, {
+    ignore: { ...IGNORE, syncSelfCode: false },
+    maxHashBytes: 8,
+  });
   const paths = manifest.entries.map((e) => e.path).sort();
   assert.deepEqual(paths, [".obsidian/app.json", "a.md", "big.bin", "dir/b.md"]);
   const big = manifest.entries.find((e) => e.path === "big.bin");

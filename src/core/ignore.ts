@@ -63,7 +63,8 @@ export function isIgnored(path: string, config: IgnoreConfig): boolean {
   // 配对码两端必须不同、基线每端独立、tmp 是传输中间产物，同步它们必然互相破坏。
   if (config.selfPluginId) {
     const selfDir = `${configDir}/plugins/${config.selfPluginId}`;
-    if (normalized === selfDir || normalized.startsWith(`${selfDir}/`)) {
+    if (normalized === selfDir) return config.syncSelfCode === false;
+    if (normalized.startsWith(`${selfDir}/`)) {
       // 未显式关闭即视为开启（与设置项默认值一致）
       if (config.syncSelfCode === false) return true;
       const relative = normalized.slice(selfDir.length + 1);

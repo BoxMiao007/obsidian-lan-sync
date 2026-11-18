@@ -633,3 +633,49 @@ async function withSession(base, fn) {
     });
   }
 }
+
+test("端到端：本插件程序文件会同步，配对码/基线/临时文件不会", async () => {
+  const remoteRoot = makeTempDir("lan-remote12-");
+  const localRoot = makeTempDir("lan-local12-");
+  writeFile(remoteRoot, ".obsidian/plugins/lan-sync/main.js", "console.log('v1')");
+  writeFile(remoteRoot, ".obsidian/plugins/lan-sync/manifest.json", '{"id":"lan-sync"}');
+  writeFile(remoteRoot, ".obsidian/plugins/lan-sync/styles.css", ".x{}");
+  writeFile(remoteRoot, ".obsidian/plugins/lan-sync/data.json", '{"token":"SECRET"}');
+  writeFile(remoteRoot, ".obsidian/plugins/lan-sync/baseline.json", '{"version":1}');
+  writeFile(remoteRoot, ".obsidian/plugins/lan-sync/tmp/a.part", "junk");
+  writeFile(remoteRoot, "note.md", "hello");
+
+  const handle = await createSyncServer({
+    port: 39311,
+    token: TOKEN,
+    uploadDir: path.join(remoteRoot, ".tmp-upload"),
+    vaultDir: remoteRoot,
+    ignore: IGNORE,
+    log: () => {},
+  });
+
+  try {
+    const base = `http://127.0.0.1:${handle.port}`;
+    const { plan } = await pullOnce(base, localRoot);
+    const paths = plan.downloads.map((d) => d.path).sort();
+
+    assert.ok(paths.includes(".obsidian/plugins/lan-sync/main.js"), "main.js 应同步");
+    assert.ok(paths.includes(".obsidian/plugins/lan-sync/manifest.json"), "manifest 应同步");
+    assert.ok(paths.includes(".obsidian/plugins/lan-sync/styles.css"), "styles.css 应同步");
+    assert.ok(paths.includes("note.md"));
+
+    for (const forbidden of ["data.json", "baseline.json", "tmp/a.part"]) {
+      assert.ok(
+        !paths.some((p) => p.endsWith(forbidden)),
+        `${forbidden} 绝不能同步（含凭据/基线/临时文件）`
+      );
+    }
+
+    assert.equal(fs.readFileSync(path.join(localRoot, ".obsidian/plugins/lan-sync/main.js"), "utf8"), "console.log('v1')");
+    assert.equal(fs.existsSync(path.join(localRoot, ".obsidian/plugins/lan-sync/data.json")), false);
+    assert.equal(fs.existsSync(path.join(localRoot, ".obsidian/plugins/lan-sync/baseline.json")), false);
+    assert.equal(fs.existsSync(path.join(localRoot, ".obsidian/plugins/lan-sync/tmp/a.part")), false);
+  } finally {
+    await handle.close();
+  }
+});
