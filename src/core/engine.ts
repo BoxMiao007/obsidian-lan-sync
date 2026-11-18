@@ -78,6 +78,13 @@ export async function applyPullPlan(
       await ensureDir(adapter, dirname(tmpPath));
       let first = true;
       let received = 0;
+
+      if (item.size === 0) {
+        // 空文件不会产生任何分块，必须显式写一个空文件，否则 tmp 文件根本不存在
+        await adapter.writeBinary(tmpPath, new ArrayBuffer(0));
+        first = false;
+      }
+
       const result = await downloader.downloadFile(item.path, item.size, async ({ chunk, offset }) => {
         if (first) {
           await adapter.writeBinary(tmpPath, chunk);
@@ -93,7 +100,7 @@ export async function applyPullPlan(
 
       if (received !== item.size) throw new Error(`大小不符：${received}/${item.size}`);
       const stat = await adapter.stat(tmpPath);
-      if (!stat || stat.size !== item.size) throw new Error(`临时文件大小异常：${stat?.size}`);
+      if (!stat || stat.size !== item.size) throw new Error(`临时文件大小异常：${stat?.size}/${item.size}`);
 
       await ensureDir(adapter, dirname(item.path));
       if (await adapter.exists(item.path)) await adapter.remove(item.path);

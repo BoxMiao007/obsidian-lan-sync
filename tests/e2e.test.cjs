@@ -408,3 +408,112 @@ test("端到端：两端同时修改 → 冲突，双方文件原样保留", asy
     await handle.close();
   }
 });
+
+test("端到端：中文路径、空格、空文件、深目录", async () => {
+  const remoteRoot = makeTempDir("lan-remote7-");
+  const localRoot = makeTempDir("lan-local7-");
+  writeFile(remoteRoot, "工具与配置/环境 部署.md", "中文内容");
+  writeFile(remoteRoot, "empty.md", "");
+  writeFile(remoteRoot, "a/b/c/d/e/deep.md", "deep");
+  writeFile(remoteRoot, "带#号和%百分号.md", "special chars");
+
+  const handle = await createSyncServer({
+    port: 39306,
+    token: TOKEN,
+    uploadDir: path.join(remoteRoot, ".tmp-upload"),
+    vaultDir: remoteRoot,
+    ignore: IGNORE,
+    log: () => {},
+  });
+
+  try {
+    const base = `http://127.0.0.1:${handle.port}`;
+    const { plan, result } = await pullOnce(base, localRoot);
+    assert.equal(plan.downloads.length, 4);
+    assert.equal(result.errors.length, 0, JSON.stringify(result.errors));
+    assert.equal(fs.readFileSync(path.join(localRoot, "工具与配置/环境 部署.md"), "utf8"), "中文内容");
+    assert.equal(fs.statSync(path.join(localRoot, "empty.md")).size, 0);
+    assert.equal(fs.readFileSync(path.join(localRoot, "a/b/c/d/e/deep.md"), "utf8"), "deep");
+    assert.equal(fs.readFileSync(path.join(localRoot, "带#号和%百分号.md"), "utf8"), "special chars");
+  } finally {
+    await handle.close();
+  }
+});
+
+test("服务端拒绝路径穿越与非法路径", async () => {
+  const remoteRoot = makeTempDir("lan-remote8-");
+  writeFile(remoteRoot, "ok.md", "fine");
+  const handle = await createSyncServer({
+    port: 39307,
+    token: TOKEN,
+    uploadDir: path.join(remoteRoot, ".tmp-upload"),
+    vaultDir: remoteRoot,
+    ignore: IGNORE,
+    log: () => {},
+  });
+
+  try {
+    const base = `http://127.0.0.1:${handle.port}`;
+    const start = await fetch(`${base}/api/v1/session/start`, {
+      method: "POST",
+      headers: { "x-lan-sync-token": TOKEN },
+    });
+    const { sessionId } = await start.json();
+    const headers = { "x-lan-sync-token": TOKEN, "x-lan-sync-session": sessionId };
+
+    const attacks = [
+      "../../../etc/passwd",
+      "..%2F..%2Fsecret.txt",
+      "/etc/passwd",
+      "C:/Windows/win.ini",
+      "..\\..\\windows\\win.ini",
+    ];
+    for (const attack of attacks) {
+      const resp = await fetch(`${base}/api/v1/file?path=${encodeURIComponent(attack)}`, { headers });
+      assert.ok(resp.status >= 400, `路径 ${attack} 应被拒绝，实际 ${resp.status}`);
+    }
+
+    // 忽略规则里的路径也不允许上传
+    const init = await fetch(`${base}/api/v1/upload/init`, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ path: ".git/config", size: 4 }),
+    });
+    assert.ok(init.status >= 400, ".git/config 上传应被拒绝");
+
+    await fetch(`${base}/api/v1/session/end?sessionId=${sessionId}`, { method: "POST", headers });
+  } finally {
+    await handle.close();
+  }
+});
+
+test("端到端：本机把文件重命名（删除+新增）能正确传播到电脑", async () => {
+  const remoteRoot = makeTempDir("lan-remote9-");
+  const localRoot = makeTempDir("lan-local9-");
+  writeFile(remoteRoot, "旧名.md", "内容不变", 1700000000);
+
+  const handle = await createSyncServer({
+    port: 39308,
+    token: TOKEN,
+    uploadDir: path.join(remoteRoot, ".tmp-upload"),
+    vaultDir: remoteRoot,
+    ignore: IGNORE,
+    log: () => {},
+  });
+
+  try {
+    const base = `http://127.0.0.1:${handle.port}`;
+    await pullOnce(base, localRoot);
+
+    fs.renameSync(path.join(localRoot, "旧名.md"), path.join(localRoot, "新名.md"));
+
+    const { plan, result } = await syncOnce(base, localRoot, undefined, "push");
+    assert.deepEqual(plan.uploads.map((u) => u.path), ["新名.md"]);
+    assert.deepEqual(plan.deleteRemote, ["旧名.md"]);
+    assert.equal(result.errors.length, 0, JSON.stringify(result.errors));
+    assert.equal(fs.readFileSync(path.join(remoteRoot, "新名.md"), "utf8"), "内容不变");
+    assert.equal(fs.existsSync(path.join(remoteRoot, "旧名.md")), false);
+  } finally {
+    await handle.close();
+  }
+});

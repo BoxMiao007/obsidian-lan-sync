@@ -27,6 +27,13 @@
 2. 手机端装 BRAT 插件 → Add Beta plugin → 填 `你的用户名/obsidian-lan-sync`。
 3. 或者手动：把 `main.js` / `manifest.json` / `styles.css` 放进 `<库>/.obsidian/plugins/lan-sync/`。
 
+## 已知限制
+
+- 手机端无法分块**读取**（Obsidian 适配器只能整包 `readBinary`），所以超过 24MB 的文件两端只能按大小比较，大小相同但内容变了的改动检测不到；超过 32MB 的文件暂不支持从手机上传。
+- 手机端 Obsidian 切到后台会被冻结，自动同步只在 app 前台时可靠。
+- 电脑端 Obsidian 必须开着，服务才在。
+- 明文 HTTP 是安卓当前的过渡特性，未来 Obsidian 若收紧，需要切自签 HTTPS（协议层已隔离，只改 `src/net/remote.ts`）。
+
 ## 安全边界
 
 - 只监听局域网，配对码错误一律 401；请求体带 `x-lan-sync-token`。
