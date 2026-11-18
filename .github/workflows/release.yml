@@ -13,16 +13,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # 版本由 package.json 的 packageManager 字段决定，这里不能再写 version
       - uses: pnpm/action-setup@v4
-        with:
-          version: 9
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: pnpm
+
       - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - uses: softprops/action-gh-release@v2
+
+      - name: Type check and build
+        run: pnpm build
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             main.js

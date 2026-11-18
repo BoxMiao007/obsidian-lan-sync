@@ -1,6 +1,6 @@
 {
   "name": "obsidian-lan-sync",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Obsidian LAN sync between desktop and mobile over the same Wi-Fi, without any cloud service.",
   "private": true,
   "scripts": {
@@ -20,5 +20,6 @@
     "esbuild": "^0.28.2",
     "obsidian": "^1.14.4",
     "typescript": "^7.0.2"
-  }
+  },
+  "packageManager": "pnpm@9"
 }
