@@ -15,6 +15,10 @@ export interface LanSyncSettings {
   clientPort: number;
   /** 手机端填写的配对码 */
   clientToken: string;
+  /** 分块大小（MB），手机端 OOM 时调小 */
+  chunkMB: number;
+  /** 单次同步允许的最大删除数 */
+  maxDeletes: number;
 }
 
 export const DEFAULT_SETTINGS: LanSyncSettings = {
@@ -24,6 +28,8 @@ export const DEFAULT_SETTINGS: LanSyncSettings = {
   clientHost: "",
   clientPort: 28900,
   clientToken: "",
+  chunkMB: 4,
+  maxDeletes: 20,
 };
 
 export class LanSyncSettingTab extends PluginSettingTab {
@@ -245,6 +251,50 @@ export class LanSyncSettingTab extends PluginSettingTab {
           .setCta()
           .onClick(async () => {
             await this.plugin.runSelfTest();
+          })
+      );
+
+    new Setting(card)
+      .setName("同步")
+      .setDesc("v0.1：只把电脑上的改动拉到本机；本机改动不会回传。")
+      .addButton((btn) =>
+        btn
+          .setButtonText("从电脑同步到本机")
+          .setCta()
+          .onClick(async () => {
+            await this.plugin.runPullSync();
+          })
+      );
+
+    new Setting(card)
+      .setName("分块大小")
+      .setDesc("默认 4MB。手机自检如果 8MB 失败，调成 1–2MB。")
+      .addText((text) =>
+        text
+          .setPlaceholder("4")
+          .setValue(String(this.plugin.settings.chunkMB))
+          .onChange(async (value) => {
+            const parsed = parseFloat(value);
+            if (Number.isFinite(parsed) && parsed >= 0.25 && parsed <= 16) {
+              this.plugin.settings.chunkMB = parsed;
+              await this.plugin.saveSettings();
+            }
+          })
+      );
+
+    new Setting(card)
+      .setName("删除保护阈值")
+      .setDesc("一次同步要删除超过这么多文件就中止，防止误删/换机清空。")
+      .addText((text) =>
+        text
+          .setPlaceholder("20")
+          .setValue(String(this.plugin.settings.maxDeletes))
+          .onChange(async (value) => {
+            const parsed = parseInt(value, 10);
+            if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 1000) {
+              this.plugin.settings.maxDeletes = parsed;
+              await this.plugin.saveSettings();
+            }
           })
       );
   }

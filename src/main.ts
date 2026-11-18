@@ -19,6 +19,12 @@ import {
 } from "./client";
 import { createSyncServer, type SyncServerHandle } from "./server";
 import { DEFAULT_SETTINGS, LanSyncSettingTab, type LanSyncSettings } from "./settings";
+import { buildManifest } from "./core/manifest";
+import { planSync, summarizePlan, type SyncPlan } from "./core/plan";
+import { emptyBaseline, type Baseline, type FileEntry } from "./core/types";
+import { applyPullPlan } from "./core/engine";
+import { HttpRemote } from "./net/remote";
+import type { IgnoreConfig } from "./core/ignore";
 
 export default class LanSyncPlugin extends Plugin {
   settings!: LanSyncSettings;
@@ -53,6 +59,12 @@ export default class LanSyncPlugin extends Plugin {
       id: "clean-temp-files",
       name: "清理自检临时文件",
       callback: () => void this.cleanTempFiles(),
+    });
+
+    this.addCommand({
+      id: "pull-from-desktop",
+      name: "从电脑同步到本机（v0.1）",
+      callback: () => void this.runPullSync(),
     });
 
     if (Platform.isDesktopApp && this.settings.autoStartServer) {
@@ -96,6 +108,34 @@ export default class LanSyncPlugin extends Plugin {
     return normalizePath(`${this.app.vault.configDir}/plugins/lan-sync/tmp`);
   }
 
+  pluginDir(): string {
+    return normalizePath(`${this.app.vault.configDir}/plugins/lan-sync`);
+  }
+
+  ignoreConfig(): IgnoreConfig {
+    return { configDir: this.app.vault.configDir, selfPluginId: "lan-sync" };
+  }
+
+  async loadBaseline(): Promise<Baseline> {
+    const adapter: any = this.app.vault.adapter;
+    const path = `${this.pluginDir()}/baseline.json`;
+    try {
+      if (!(await adapter.exists(path))) return emptyBaseline();
+      const raw = await adapter.read(path);
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.version === 1 && parsed.entries) return parsed as Baseline;
+    } catch (err) {
+      this.log(`读取基线失败，按首次同步处理：${errMsg(err)}`);
+    }
+    return emptyBaseline();
+  }
+
+  async saveBaseline(baseline: Baseline): Promise<void> {
+    const adapter: any = this.app.vault.adapter;
+    const path = `${this.pluginDir()}/baseline.json`;
+    await adapter.write(path, JSON.stringify(baseline));
+  }
+
   async startServer(): Promise<void> {
     if (!Platform.isDesktopApp) throw new Error("服务端只能在电脑端运行");
     if (this.server) return;
@@ -109,6 +149,8 @@ export default class LanSyncPlugin extends Plugin {
       token: this.settings.token,
       uploadDir: this.tempDir(),
       pluginDir,
+      vaultDir: basePath || undefined,
+      ignore: this.ignoreConfig(),
       log: (line) => this.log(line),
     });
     this.log(`服务端地址：${this.server.urls.join(" | ")}，配对码 ${this.settings.token}`);
@@ -214,8 +256,151 @@ export default class LanSyncPlugin extends Plugin {
     new ReportModal(this.app, report).open();
   }
 
-  async cleanTempFiles(): Promise<void> {
+  private syncRunning = false;
+
+  async runPullSync(): Promise<void> {
+    if (this.syncRunning) {
+      new Notice("同步正在进行，请稍候…");
+      return;
+    }
+    let target: Target;
+    try {
+      target = this.resolveTarget();
+    } catch (err) {
+      new Notice(errMsg(err));
+      return;
+    }
+
+    this.syncRunning = true;
+    const notice = new Notice("正在扫描本机文件…", 0);
+    try {
+      const adapter: any = this.app.vault.adapter;
+      const local = await buildManifest(adapter, {
+        ignore: this.ignoreConfig(),
+        maxHashBytes: 24 * 1024 * 1024,
+        onProgress: (info) => {
+          if (info.scanned % 25 === 0) notice.setMessage(`扫描中 ${info.scanned}：${info.current}`);
+        },
+      });
+
+      notice.setMessage("正在获取电脑上的文件清单…");
+      const chunkBytes = Math.max(0.25, this.settings.chunkMB) * 1024 * 1024;
+      const remote = new HttpRemote(target.base, target.token, chunkBytes);
+      const remoteManifest = await remote.fetchManifest();
+      const baseline = await this.loadBaseline();
+      const plan = planSync(local.entries, remoteManifest.entries, baseline, {
+        mode: "pull",
+        maxDeletes: this.settings.maxDeletes,
+      });
+      notice.hide();
+
+      this.log(
+        `同步预览：本机 ${local.entries.length} / 电脑 ${remoteManifest.entries.length} → ${summarizePlan(plan)}`
+      );
+
+      new SyncPreviewModal(this.app, {
+        plan,
+        localCount: local.entries.length,
+        remoteCount: remoteManifest.entries.length,
+        firstSync: baseline.updatedAt === 0,
+        onConfirm: () => this.applyPull(plan, remote, remoteManifest.entries, baseline),
+      }).open();
+    } catch (err) {
+      notice.hide();
+      new ReportModal(this.app, `同步失败：${errMsg(err)}`).open();
+    } finally {
+      this.syncRunning = false;
+    }
+  }
+
+  private async applyPull(
+    plan: SyncPlan,
+    remote: HttpRemote,
+    remoteEntries: FileEntry[],
+    baseline: Baseline
+  ): Promise<void> {
     const adapter: any = this.app.vault.adapter;
+    const progress = new Notice("开始同步…", 0);
+    let lastTick = 0;
+    try {
+      // 首次同步或覆盖/删除前，先把会被改动的文件备份到 .trash（同步忽略 .trash）
+      const backupTargets: string[] = [...plan.deleteLocal];
+      for (const item of plan.downloads) {
+        if (await adapter.exists(item.path)) backupTargets.push(item.path);
+      }
+      let backedUp = 0;
+      if (backupTargets.length) {
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        progress.setMessage(`正在备份 ${backupTargets.length} 个将被覆盖/删除的文件…`);
+        backedUp = await this.backupFiles(backupTargets, `.trash/lan-sync-backup-${stamp}`);
+      }
+
+      const result = await applyPullPlan(adapter, remote, plan, baseline, {
+        tmpDir: this.tempDir(),
+        remoteEntries,
+        onProgress: (info) => {
+          const now = Date.now();
+          if (now - lastTick > 300) {
+            lastTick = now;
+            progress.setMessage(`同步中 ${info.done}/${info.total}：${info.label}`);
+          }
+        },
+      });
+      await this.saveBaseline(result.newBaseline);
+      progress.hide();
+
+      const lines = [
+        "LAN Sync · 同步结果",
+        `下载/更新：${result.appliedDownloads.length} 个（${formatBytes(result.bytes)}）`,
+        `删除本机：${result.appliedDeletes.length} 个`,
+        `已备份：${backedUp} 个（.trash/lan-sync-backup-*）`,
+        `冲突未处理：${plan.conflicts.length} 个`,
+        `跳过：${plan.skipped.length} 个`,
+      ];
+      if (result.errors.length) {
+        lines.push("", `失败 ${result.errors.length} 个：`);
+        for (const item of result.errors.slice(0, 20)) lines.push(`  ✗ ${item.path}：${item.message}`);
+      }
+      if (plan.conflicts.length) {
+        lines.push("", "冲突文件（两端都改过，本次保持原样）：");
+        for (const item of plan.conflicts.slice(0, 20)) lines.push(`  ⚠ ${item.path}（${item.reason}）`);
+      }
+      this.log(
+        `同步完成：下载 ${result.appliedDownloads.length}，删除 ${result.appliedDeletes.length}，错误 ${result.errors.length}`
+      );
+      new ReportModal(this.app, lines.join("\n")).open();
+    } catch (err) {
+      progress.hide();
+      new ReportModal(this.app, `同步中断：${errMsg(err)}`).open();
+    }
+  }
+
+  /** 覆盖/删除前把文件复制到 .trash，避免首次同步或误判造成不可逆损失。 */
+  private async backupFiles(paths: string[], folder: string): Promise<number> {
+    const adapter: any = this.app.vault.adapter;
+    let count = 0;
+    for (const path of paths) {
+      try {
+        if (!(await adapter.exists(path))) continue;
+        const stat = await adapter.stat(path);
+        if (!stat || stat.type !== "file") continue;
+        if (stat.size > 24 * 1024 * 1024) {
+          this.log(`跳过备份超大文件：${path}（${formatBytes(stat.size)}）`);
+          continue;
+        }
+        const data = await adapter.readBinary(path);
+        const dest = `${folder}/${path}`;
+        await ensureParentDir(adapter, dest);
+        await adapter.writeBinary(dest, data);
+        count++;
+      } catch (err) {
+        this.log(`备份失败 ${path}：${errMsg(err)}`);
+      }
+    }
+    return count;
+  }
+
+  async cleanTempFiles(): Promise<void> {    const adapter: any = this.app.vault.adapter;
     const dir = this.tempDir();
     let removed = 0;
     try {
@@ -295,6 +480,84 @@ function summarize(results: StepResult[]): string {
   return "全部通过：明文 HTTP 可用，分块传输与落盘都正常，可以进入正式实现。";
 }
 
+interface SyncPreviewOptions {
+  plan: SyncPlan;
+  localCount: number;
+  remoteCount: number;
+  firstSync: boolean;
+  onConfirm: () => Promise<void>;
+}
+
+class SyncPreviewModal extends Modal {
+  private busy = false;
+  private options: SyncPreviewOptions;
+
+  constructor(app: App, options: SyncPreviewOptions) {
+    super(app);
+    this.options = options;
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    this.setTitle("同步预览（尚未写入任何文件）");
+    contentEl.createEl("p", {
+      text: `本机 ${this.options.localCount} 个文件 · 电脑 ${this.options.remoteCount} 个文件`,
+    });
+    if (this.options.firstSync) {
+      contentEl.createEl("p", {
+        cls: "lan-sync-warn",
+        text: "这是首次同步：请先看完清单再开始，建议先备份手机库。",
+      });
+    }
+
+    const plan = this.options.plan;
+    const lines: string[] = [summarizePlan(plan), ""];
+    if (plan.breaker) lines.push(`⛔ ${plan.breaker.message}`, "");
+    appendSection(lines, "将下载 / 覆盖本机", plan.downloads.map((d) => `${d.path}（${formatBytes(d.size)}）`));
+    appendSection(lines, "将删除本机", plan.deleteLocal);
+    appendSection(lines, "冲突（本次不处理）", plan.conflicts.map((c) => `${c.path}（${c.reason}）`));
+    appendSection(lines, "跳过", plan.skipped.map((s) => `${s.path}：${s.reason}`));
+
+    const pre = contentEl.createEl("pre", { cls: "lan-sync-report" });
+    pre.setText(lines.join("\n"));
+
+    const buttons = contentEl.createDiv({ cls: "lan-sync-modal-buttons" });
+    const cancel = buttons.createEl("button", { text: "取消" });
+    cancel.addEventListener("click", () => this.close());
+
+    const confirm = buttons.createEl("button", {
+      text: plan.breaker ? "已中止" : "开始同步",
+      cls: "mod-cta",
+    });
+    if (plan.breaker) confirm.disabled = true;
+    confirm.addEventListener("click", () => {
+      if (this.busy) return;
+      this.busy = true;
+      confirm.disabled = true;
+      confirm.textContent = "同步中…";
+      // 先关闭预览，再在下一拍执行；否则结果弹窗会和预览叠在一起
+      this.close();
+      window.setTimeout(() => {
+        void this.options.onConfirm().catch((err) => {
+          new Notice(`同步失败：${errMsg(err)}`, 8000);
+        });
+      }, 80);
+    });
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+function appendSection(lines: string[], title: string, items: string[]): void {
+  if (!items.length) return;
+  lines.push(`【${title}】共 ${items.length} 项`);
+  for (const item of items.slice(0, 30)) lines.push(`  ${item}`);
+  if (items.length > 30) lines.push(`  …还有 ${items.length - 30} 项`);
+  lines.push("");
+}
+
 class ReportModal extends Modal {
   private report: string;
 
@@ -330,4 +593,16 @@ class ReportModal extends Modal {
 
 function randomPairCode(): string {
   return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+async function ensureParentDir(adapter: any, filePath: string): Promise<void> {
+  const index = filePath.lastIndexOf("/");
+  if (index <= 0) return;
+  const dir = filePath.slice(0, index);
+  const parts = dir.split("/");
+  let current = "";
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    if (!(await adapter.exists(current))) await adapter.mkdir(current);
+  }
 }

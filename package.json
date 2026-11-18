@@ -1,13 +1,17 @@
 {
   "name": "obsidian-lan-sync",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Obsidian LAN sync between desktop and mobile over the same Wi-Fi, without any cloud service.",
   "private": true,
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "build:server": "esbuild src/server.ts --bundle --platform=node --format=cjs --outfile=dist/server.cjs",
+    "build:core": "esbuild src/core/index.ts --bundle --platform=node --format=cjs --outfile=dist/core.cjs",
+    "test:core": "pnpm build:core && node tests/core.test.cjs",
     "test:server": "pnpm build:server && node tests/server.test.cjs",
+    "test:e2e": "pnpm build:server && pnpm build:core && node tests/e2e.test.cjs",
+    "test": "pnpm test:core && pnpm test:server && pnpm test:e2e",
     "serve": "pnpm build:server && node scripts/serve.mjs"
   },
   "devDependencies": {

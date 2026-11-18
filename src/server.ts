@@ -10,6 +10,9 @@
 
 declare const require: (id: string) => any;
 
+import { isIgnored, type IgnoreConfig } from "./core/ignore";
+import type { FileEntry, Manifest } from "./core/types";
+
 export interface SyncServerOptions {
   /** 期望端口，被占用时自动往后顺延 */
   port: number;
@@ -19,6 +22,10 @@ export interface SyncServerOptions {
   uploadDir: string;
   /** 本插件在电脑上的绝对目录，用于给手机端提供安装文件下载 */
   pluginDir?: string;
+  /** 要被同步的库根目录（绝对路径）；不传则 /api/v1 不可用 */
+  vaultDir?: string;
+  /** 与服务端一致的忽略规则 */
+  ignore?: IgnoreConfig;
   log?: (line: string) => void;
 }
 
@@ -62,7 +69,88 @@ export async function createSyncServer(opts: SyncServerOptions): Promise<SyncSer
   const uploadRoot = path.join(opts.uploadDir, "spike-uploads");
   fs.mkdirSync(uploadRoot, { recursive: true });
 
+  const ignoreConfig: IgnoreConfig =
+    opts.ignore ?? { configDir: ".obsidian", selfPluginId: "lan-sync" };
+
   const sha256 = (buf: any): string => crypto.createHash("sha256").update(buf).digest("hex");
+
+  /** 服务端清单缓存：path -> 大小/mtime/哈希，未变则复用 */
+  const manifestCache = new Map<string, { size: number; mtime: number; sha256: string | null }>();
+
+  const hashFile = async (absPath: string, size: number): Promise<string | null> => {
+    try {
+      if (size <= 24 * 1024 * 1024) {
+        return sha256(fs.readFileSync(absPath));
+      }
+      return await new Promise<string>((resolve, reject) => {
+        const hash = crypto.createHash("sha256");
+        const stream = fs.createReadStream(absPath);
+        stream.on("data", (chunk: any) => hash.update(chunk));
+        stream.on("end", () => resolve(hash.digest("hex")));
+        stream.on("error", reject);
+      });
+    } catch {
+      return null;
+    }
+  };
+
+  const listVaultFiles = (): string[] => {
+    const root: string = opts.vaultDir as string;
+    const out: string[] = [];
+    const walk = (rel: string) => {
+      const abs = rel ? path.join(root, rel) : root;
+      let entries: any[];
+      try {
+        entries = fs.readdirSync(abs, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const ent of entries) {
+        const childRel = rel ? `${rel}/${ent.name}` : ent.name;
+        if (isIgnored(childRel, ignoreConfig)) continue;
+        if (ent.isDirectory()) walk(childRel);
+        else if (ent.isFile()) out.push(childRel);
+      }
+    };
+    walk("");
+    return out.sort();
+  };
+
+  const buildServerManifest = async (): Promise<Manifest> => {
+    const entries: FileEntry[] = [];
+    for (const rel of listVaultFiles()) {
+      const abs = path.join(opts.vaultDir as string, rel);
+      let stat: any;
+      try {
+        stat = fs.statSync(abs);
+      } catch {
+        continue;
+      }
+      const size = stat.size;
+      const mtime = Math.trunc(stat.mtimeMs || 0);
+      const cached = manifestCache.get(rel);
+      let hash: string | null;
+      if (cached && cached.size === size && cached.mtime === mtime) {
+        hash = cached.sha256;
+      } else {
+        hash = await hashFile(abs, size);
+        manifestCache.set(rel, { size, mtime, sha256: hash });
+      }
+      entries.push({ path: rel, size, mtime, sha256: hash });
+    }
+    return { generatedAt: Date.now(), entries };
+  };
+
+  const resolveVaultFile = (relPath: string): string | null => {
+    const root: string = opts.vaultDir as string;
+    const normalized = String(relPath || "").replace(/\\/g, "/");
+    if (!normalized || normalized.includes("..") || normalized.startsWith("/")) return null;
+    const abs = path.resolve(root, normalized);
+    const rootAbs = path.resolve(root);
+    if (abs !== rootAbs && !abs.startsWith(rootAbs + path.sep)) return null;
+    return abs;
+  };
+
 
   const getBlob = (mb: number): any => {
     const key = String(mb);
@@ -222,6 +310,53 @@ document.getElementById("test").addEventListener("click", async () => {
 
         if (!authorized()) {
           sendJson(401, { ok: false, error: "配对码不正确" });
+          return;
+        }
+
+        // ===== v1 同步协议 =====
+        if (pathname === "/api/v1/manifest" && req.method === "GET") {
+          if (!opts.vaultDir) throw new Error("服务端未配置 vaultDir");
+          const manifest = await buildServerManifest();
+          sendJson(200, { ok: true, ...manifest });
+          return;
+        }
+
+        if (pathname === "/api/v1/file" && req.method === "GET") {
+          if (!opts.vaultDir) throw new Error("服务端未配置 vaultDir");
+          const abs = resolveVaultFile(url.searchParams.get("path") || "");
+          if (!abs) throw new Error("路径不合法");
+          if (!fs.existsSync(abs)) {
+            sendJson(404, { ok: false, error: "文件不存在" });
+            return;
+          }
+          const stat = fs.statSync(abs);
+          if (!stat.isFile()) throw new Error("不是文件");
+          const size = stat.size;
+          const offset = clampInt(parseInt(url.searchParams.get("offset") || "0", 10) || 0, 0, size);
+          const lenRaw = parseInt(url.searchParams.get("len") || "", 10);
+          const len = Number.isFinite(lenRaw) && lenRaw > 0
+            ? Math.min(lenRaw, size - offset)
+            : size - offset;
+
+          const buffer = Buffer.alloc(len);
+          if (len > 0) {
+            const fd = fs.openSync(abs, "r");
+            try {
+              fs.readSync(fd, buffer, 0, len, offset);
+            } finally {
+              fs.closeSync(fd);
+            }
+          }
+          const cached = manifestCache.get(String(url.searchParams.get("path") || ""));
+          const fileSha = cached && cached.size === size ? cached.sha256 : null;
+
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/octet-stream");
+          res.setHeader("Content-Length", String(buffer.length));
+          res.setHeader("x-file-size", String(size));
+          res.setHeader("x-chunk-sha256", sha256(buffer));
+          if (fileSha) res.setHeader("x-file-sha256", fileSha);
+          res.end(buffer);
           return;
         }
 
