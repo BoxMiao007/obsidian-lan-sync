@@ -335,16 +335,15 @@ export default class LanSyncPlugin extends Plugin {
 
       const hasWork =
         plan.downloads.length + plan.uploads.length + plan.deleteLocal.length + plan.deleteRemote.length > 0;
-      const mustPreview =
-        !auto || baseline.updatedAt === 0 || Boolean(plan.breaker) || plan.conflicts.length > 0;
-
-      if (!mustPreview && hasWork) {
-        // 自动同步：无人值守时不弹预览，直接应用（首次同步 / 冲突 / 熔断仍然会弹）
-        await this.applySync(plan, remote, remoteManifest.entries, baseline);
+      if (!hasWork) {
+        if (!auto) new ReportModal(this.app, "没有需要同步的改动（两端一致）。").open();
         return;
       }
-      if (!auto && !hasWork) {
-        new ReportModal(this.app, "没有需要同步的改动（两端一致）。").open();
+
+      const mustPreview = !auto || baseline.updatedAt === 0 || Boolean(plan.breaker) || plan.conflicts.length > 0;
+      if (!mustPreview) {
+        // 自动同步：无人值守时不弹预览，直接应用（首次同步 / 冲突 / 熔断仍然会弹）
+        await this.applySync(plan, remote, remoteManifest.entries, baseline);
         return;
       }
 
@@ -373,6 +372,7 @@ export default class LanSyncPlugin extends Plugin {
   ): Promise<void> {
     const adapter: any = this.app.vault.adapter;
     const progress = new Notice("开始同步…", 0);
+    this.applying = true;
     let lastTick = 0;
     const tick = (label: string) => {
       const now = Date.now();
@@ -460,6 +460,8 @@ export default class LanSyncPlugin extends Plugin {
     } catch (err) {
       progress.hide();
       new ReportModal(this.app, `同步中断：${errMsg(err)}`).open();
+    } finally {
+      this.applying = false;
     }
   }
 
@@ -469,7 +471,9 @@ export default class LanSyncPlugin extends Plugin {
     const chunkBytes = Math.max(0.25, this.settings.chunkMB) * 1024 * 1024;
     const remote = new HttpRemote(target.base, target.token, chunkBytes);
     const adapter: any = this.app.vault.adapter;
-    const baseline = await this.loadBaseline();
+    this.applying = true;
+    try {
+      const baseline = await this.loadBaseline();
     const remoteItem: ChangeItem = {
       path: conflict.path,
       size: conflict.remoteSize,
@@ -510,6 +514,9 @@ export default class LanSyncPlugin extends Plugin {
       await this.saveBaseline(result.newBaseline);
     }
     this.log(`解决冲突：${conflict.path} → ${choice}`);
+    } finally {
+      this.applying = false;
+    }
   }
 
   /** 覆盖/删除前把文件复制到 .trash，避免首次同步或误判造成不可逆损失。 */
