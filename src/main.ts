@@ -343,8 +343,13 @@ export default class LanSyncPlugin extends Plugin {
   }
 
   async runSync(auto = false): Promise<void> {
+    // 自动同步有多个触发源（打开 app / 回到前台 / 文件变更 / 定时），
+    // 它们可能在几秒内同时触发。这里做最小间隔节流，避免重复同步和重复提示。
+    // 手动点击（auto=false）不受限制，随时可以强制同步。
+    if (auto && Date.now() - this.lastSyncAt < 15_000) return;
+
     if (this.syncRunning) {
-      new Notice("同步正在进行，请稍候…");
+      if (!auto) new Notice("同步正在进行，请稍候…");
       return;
     }
     let target: Target;
