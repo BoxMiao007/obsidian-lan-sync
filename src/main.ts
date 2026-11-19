@@ -25,6 +25,7 @@ import { emptyBaseline, type Baseline, type FileEntry } from "./core/types";
 import { applyPullPlan, applyPushPlan, applyConflictChoice } from "./core/engine";
 import { HttpRemote } from "./net/remote";
 import type { IgnoreConfig } from "./core/ignore";
+import { isIgnored } from "./core/ignore";
 
 export default class LanSyncPlugin extends Plugin {
   settings!: LanSyncSettings;
@@ -112,8 +113,12 @@ export default class LanSyncPlugin extends Plugin {
     this.register(() => document.removeEventListener("visibilitychange", onVisibility));
 
     // 文件变更：防抖后排队；若正在同步，只标记待跑，结束后补一次（不丢编辑）
-    const onVaultChange = () => {
+    const onVaultChange = (file?: { path?: string }) => {
       if (!this.settings.syncEnabled || this.settings.syncDebounceSeconds <= 0) return;
+      // 忽略插件自身目录（基线文件每次同步都会写）、.trash、.git 等，
+      // 否则「写基线」会再次触发同步，形成自我循环。
+      const changedPath = file && typeof file.path === "string" ? file.path : "";
+      if (changedPath && isIgnored(changedPath, this.ignoreConfig())) return;
       if (this.syncRunning || this.applying) {
         this.pendingAutoSync = true;
         return;
