@@ -89,6 +89,16 @@ export function planSync(
     const r = remoteMap.get(path);
     const b = base[path];
 
+    // 含未解决冲突标记的文件（坚果云/git 留下的 <<<<<<< 块）一律不碰：
+    // 两端都不动它，避免脏内容扩散；由用户先手动解决。
+    if ((l && l.unsafe) || (r && r.unsafe)) {
+      plan.skipped.push({
+        path,
+        reason: "文件含未解决的合并冲突标记（<<<<<<<），请先手动处理",
+      });
+      continue;
+    }
+
     if (l && r) {
       if (sameContent(l, r)) {
         plan.unchanged++;

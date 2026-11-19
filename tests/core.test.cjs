@@ -357,3 +357,34 @@ test("自动同步确认策略：首次/冲突/熔断必须确认", () => {
   assert.equal(onlyConflict.downloads.length + onlyConflict.uploads.length, 0);
   assert.equal(planHasWork(onlyConflict), true, "只有冲突时不能被当成没有改动");
 });
+
+test("冲突标记检测：识别坚果云/git 遗留的未解决标记", () => {
+  const { textHasConflictMarkers, detectConflictMarkers } = require("../dist/core.cjs");
+
+  const dirty = "title: x\n<<<<<<<\n更新于: 20:31\n=======\n更新于: 17:43\n>>>>>>>\nbody";
+  assert.equal(textHasConflictMarkers(dirty), true);
+
+  // 无标签（坚果云 useGitStyle）与带标签（git 标准）都算
+  const gitStyle = "a\n<<<<<<< HEAD\nleft\n=======\nright\n>>>>>>> origin/main\n";
+  assert.equal(textHasConflictMarkers(gitStyle), true);
+
+  // 正常笔记、只出现分隔线、或缺少结束标记 → 不算冲突
+  assert.equal(textHasConflictMarkers("# 正常笔记\n=======\n正文"), false);
+  assert.equal(textHasConflictMarkers("a\n<<<<<<<\nleft\n=======\nright\n"), false);
+
+  // 二进制（含 NUL）不检测
+  const bin = new Uint8Array([0, 60, 60, 60, 60, 60, 60, 60, 0]);
+  assert.equal(detectConflictMarkers(bin.buffer), false);
+});
+
+test("计划：含冲突标记的文件一律跳过，不做任何动作", () => {
+  const local = [{ ...entry("a.md", "s1"), unsafe: true }];
+  const remote = [entry("a.md", "s2")];
+  const plan = planSync(local, remote, baseOf({ "a.md": "s1" }), { mode: "both" });
+  assert.equal(plan.downloads.length + plan.uploads.length, 0);
+  assert.ok(plan.skipped.some((s) => s.path === "a.md" && s.reason.includes("冲突标记")));
+
+  const plan2 = planSync([entry("b.md", "s1")], [{ ...entry("b.md", "s2"), unsafe: true }], emptyBaseline(), { mode: "both" });
+  assert.equal(plan2.downloads.length + plan2.uploads.length, 0);
+  assert.ok(plan2.skipped.some((s) => s.path === "b.md"));
+});

@@ -679,3 +679,32 @@ test("端到端：本插件程序文件会同步，配对码/基线/临时文件
     await handle.close();
   }
 });
+
+test("端到端：带冲突标记的远端文件不会被拉到本机", async () => {
+  const remoteRoot = makeTempDir("lan-remote13-");
+  const localRoot = makeTempDir("lan-local13-");
+  writeFile(remoteRoot, "clean.md", "正常内容");
+  writeFile(remoteRoot, "dirty.md", "a\n<<<<<<<\n更新于: 20:31\n=======\n更新于: 17:43\n>>>>>>>\n");
+
+  const handle = await createSyncServer({
+    port: 39321,
+    token: TOKEN,
+    uploadDir: path.join(remoteRoot, ".tmp-upload"),
+    vaultDir: remoteRoot,
+    ignore: IGNORE,
+    log: () => {},
+  });
+
+  try {
+    const base = `http://127.0.0.1:${handle.port}`;
+    const { plan, result } = await pullOnce(base, localRoot);
+    assert.ok(plan.downloads.some((d) => d.path === "clean.md"));
+    assert.ok(!plan.downloads.some((d) => d.path === "dirty.md"), "冲突文件不应被下载");
+    assert.ok(plan.skipped.some((s) => s.path === "dirty.md"));
+    assert.equal(result.errors.length, 0);
+    assert.equal(fs.existsSync(path.join(localRoot, "dirty.md")), false);
+    assert.equal(fs.readFileSync(path.join(localRoot, "clean.md"), "utf8"), "正常内容");
+  } finally {
+    await handle.close();
+  }
+});

@@ -6,6 +6,7 @@ import type { ManifestAdapter } from "./manifest";
 import type { Baseline, FileEntry } from "./types";
 import { updateBaseline, type ChangeItem, type ConflictItem, type SyncPlan } from "./plan";
 import { sha256Buffer } from "./hash";
+import { detectConflictMarkers } from "./conflict-markers";
 
 export interface EngineAdapter extends ManifestAdapter {
   writeBinary(path: string, data: ArrayBuffer): Promise<void>;
@@ -189,6 +190,9 @@ export async function applyPushPlan(
         throw new Error(`文件 ${(item.size / 1048576).toFixed(1)}MB 超过上传上限（${(maxUploadBytes / 1048576).toFixed(0)}MB），暂不支持`);
       }
       const buffer = await adapter.readBinary(item.path);
+      if (detectConflictMarkers(buffer)) {
+        throw new Error("文件含未解决的合并冲突标记，已跳过（请先手动处理）");
+      }
       if (buffer.byteLength !== item.size) {
         throw new Error(`文件在扫描后发生变化（${buffer.byteLength}/${item.size}），请重新同步`);
       }

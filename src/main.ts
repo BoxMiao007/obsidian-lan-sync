@@ -431,9 +431,21 @@ export default class LanSyncPlugin extends Plugin {
       );
 
       const hasWork = planHasWork(plan);
+      const unsafePaths = plan.skipped
+        .filter((item) => item.reason.includes("冲突标记"))
+        .map((item) => item.path);
       if (!hasWork) {
         this.updateStatusBar("ok");
-        new Notice("两端一致，没有需要同步的改动。", 4000);
+        if (unsafePaths.length) {
+          new Notice(
+            `⚠ 发现 ${unsafePaths.length} 个文件含未解决的冲突标记，已跳过。请先手动处理：${unsafePaths
+              .slice(0, 3)
+              .join("、")}${unsafePaths.length > 3 ? " 等" : ""}`,
+            15000
+          );
+        } else {
+          new Notice("两端一致，没有需要同步的改动。", 4000);
+        }
         return;
       }
 
@@ -607,6 +619,9 @@ export default class LanSyncPlugin extends Plugin {
         errors,
         conflictItems: plan.conflicts,
         skipped: plan.skipped.length,
+        unsafeSkipped: plan.skipped
+          .filter((item) => item.reason.includes("冲突标记"))
+          .map((item) => item.path),
         selfUpdated,
         breaker: plan.breaker ? plan.breaker.message : null,
         lines,
@@ -651,9 +666,14 @@ export default class LanSyncPlugin extends Plugin {
     } else {
       text = `⇅ ${auto ? "后台同步" : "同步完成"}：${detail}`;
     }
+    if (outcome.unsafeSkipped.length) {
+      text += `；${outcome.unsafeSkipped.length} 个文件含冲突标记已跳过，需先手动解决（${outcome.unsafeSkipped
+        .slice(0, 3)
+        .join("、")}${outcome.unsafeSkipped.length > 3 ? " 等" : ""}）`;
+    }
     if (outcome.selfUpdated) text += "；插件文件已更新，需重启 Obsidian";
 
-    new Notice(text, outcome.errors.length ? 12000 : 6000);
+    new Notice(text, outcome.errors.length || outcome.unsafeSkipped.length ? 12000 : 6000);
   }
 
   /** 错误提示统一入口：三处调用格式一致，且一定写入运行日志。 */
@@ -807,6 +827,7 @@ interface SyncOutcome {
   errors: Array<{ path: string; message: string }>;
   conflictItems: ConflictItem[];
   skipped: number;
+  unsafeSkipped: string[];
   selfUpdated: boolean;
   breaker: string | null;
   lines: string[];

@@ -8,6 +8,8 @@ export interface FileEntry {
   mtime: number;
   /** 内容哈希；超大文件可能为 null（此时退化为按大小比较） */
   sha256: string | null;
+  /** 文件里存在未解决的合并冲突标记（如坚果云/git 留下的 <<<<<<< 块），不参与同步 */
+  unsafe?: boolean;
 }
 
 export interface Manifest {

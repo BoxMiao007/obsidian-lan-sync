@@ -11,6 +11,7 @@
 declare const require: (id: string) => any;
 
 import { isIgnored, type IgnoreConfig } from "./core/ignore";
+import { detectConflictMarkers } from "./core/conflict-markers";
 import type { FileEntry, Manifest } from "./core/types";
 
 export interface SyncServerOptions {
@@ -87,8 +88,11 @@ export async function createSyncServer(opts: SyncServerOptions): Promise<SyncSer
 
   const sha256 = (buf: any): string => crypto.createHash("sha256").update(buf).digest("hex");
 
-  /** 服务端清单缓存：path -> 大小/mtime/哈希，未变则复用 */
-  const manifestCache = new Map<string, { size: number; mtime: number; sha256: string | null }>();
+  /** 服务端清单缓存：path -> 大小/mtime/哈希/是否含冲突标记，未变则复用 */
+  const manifestCache = new Map<
+    string,
+    { size: number; mtime: number; sha256: string | null; unsafe: boolean }
+  >();
 
   const hashFile = async (absPath: string, size: number): Promise<string | null> => {
     try {
@@ -143,13 +147,25 @@ export async function createSyncServer(opts: SyncServerOptions): Promise<SyncSer
       const mtime = Math.trunc(stat.mtimeMs || 0);
       const cached = manifestCache.get(rel);
       let hash: string | null;
+      let unsafe = false;
       if (cached && cached.size === size && cached.mtime === mtime) {
         hash = cached.sha256;
+        unsafe = cached.unsafe;
+      } else if (size <= 24 * 1024 * 1024) {
+        // 小文件一次读入：哈希与「冲突标记」检测共用同一份内容
+        try {
+          const buffer = fs.readFileSync(abs);
+          hash = sha256(buffer);
+          unsafe = detectConflictMarkers(buffer);
+        } catch {
+          hash = null;
+        }
+        manifestCache.set(rel, { size, mtime, sha256: hash, unsafe });
       } else {
         hash = await hashFile(abs, size);
-        manifestCache.set(rel, { size, mtime, sha256: hash });
+        manifestCache.set(rel, { size, mtime, sha256: hash, unsafe });
       }
-      entries.push({ path: rel, size, mtime, sha256: hash });
+      entries.push({ path: rel, size, mtime, sha256: hash, unsafe });
     }
     return { generatedAt: Date.now(), entries };
   };

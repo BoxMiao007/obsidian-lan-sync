@@ -3,6 +3,7 @@
  * 与 Obsidian 解耦：只依赖 DataAdapter 的一个子集，便于用 Node 假适配器做端到端测试。
  */
 import { sha256Buffer } from "./hash";
+import { detectConflictMarkers } from "./conflict-markers";
 import { isIgnored, type IgnoreConfig } from "./ignore";
 import type { FileEntry, Manifest } from "./types";
 
@@ -52,10 +53,12 @@ export async function buildManifest(
     if (!stat || stat.type !== "file") continue;
     const size = stat.size;
     let sha256: string | null = null;
+    let unsafe = false;
     if (size <= maxHashBytes) {
       try {
         const buffer = await adapter.readBinary(path);
         sha256 = await hasher(buffer);
+        unsafe = detectConflictMarkers(buffer);
         hashed++;
       } catch {
         sha256 = null;
@@ -66,6 +69,7 @@ export async function buildManifest(
       size,
       mtime: Math.trunc(stat.mtime || 0),
       sha256,
+      unsafe,
     });
     options.onProgress?.({ scanned: entries.length, hashed, current: path });
   }
