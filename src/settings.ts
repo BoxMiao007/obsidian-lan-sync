@@ -73,7 +73,7 @@ export class LanSyncSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "局域网同步" });
     containerEl.createEl("p", {
       cls: "lan-sync-muted",
-      text: "同一 Wi-Fi 下，手机直接连电脑同步，不经过任何云服务。当前为 spike 版：只验证网络与写盘能力，还不同步笔记。",
+      text: "同一 Wi-Fi 下，手机直接连电脑同步，不经过任何云服务。电脑端 Obsidian 需要保持运行。",
     });
 
     this.renderServerSection(containerEl);

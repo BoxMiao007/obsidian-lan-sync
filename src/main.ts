@@ -264,7 +264,9 @@ export default class LanSyncPlugin extends Plugin {
     } catch (err) {
       this.selfTestRunning = false;
       notice.hide();
-      new ReportModal(this.app, buildReport([], null, errMsg(err))).open();
+      const message = `自检失败：${errMsg(err)}`;
+      this.log(message);
+      new Notice(message, 10000);
       return;
     }
 
@@ -316,8 +318,17 @@ export default class LanSyncPlugin extends Plugin {
     }
 
     const report = buildReport(results, target, null);
-    this.log(report.split("\n").slice(0, 2).join(" / "));
-    new ReportModal(this.app, report).open();
+    const passed = results.filter((r) => r.ok).length;
+    const failed = results.length - passed;
+    // 完整报告写进运行日志（设置页可看），只在右上角给简短结论
+    this.log(`自检完成：${passed} 项通过 / ${failed} 项失败`);
+    for (const line of report.split("\n").filter(Boolean)) this.log(line);
+    new Notice(
+      failed === 0
+        ? `✓ 自检全部通过（${passed} 项），可以开始同步`
+        : `自检完成：${passed} 项通过，${failed} 项失败。详情见设置页运行日志`,
+      failed === 0 ? 6000 : 12000
+    );
   }
 
   /** 侧栏/状态栏状态：空闲、同步中、失败。手机端没有状态栏，靠 ribbon 提示。 */
@@ -407,7 +418,7 @@ export default class LanSyncPlugin extends Plugin {
         plan.downloads.length + plan.uploads.length + plan.deleteLocal.length + plan.deleteRemote.length > 0;
       if (!hasWork) {
         this.updateStatusBar("ok");
-        if (!auto) new ReportModal(this.app, "没有需要同步的改动（两端一致）。").open();
+        new Notice("两端一致，没有需要同步的改动。", 4000);
         return;
       }
 
@@ -430,8 +441,8 @@ export default class LanSyncPlugin extends Plugin {
       notice.hide();
       this.updateStatusBar("error", errMsg(err));
       const message = `同步失败：${errMsg(err)}`;
-      if (auto) new Notice(message, 10000);
-      else new ReportModal(this.app, message).open();
+      this.log(message);
+      new Notice(message, 10000);
     } finally {
       if (remote) await remote.endSession();
       this.syncRunning = false;
@@ -556,14 +567,19 @@ export default class LanSyncPlugin extends Plugin {
       } else if (plan.conflicts.length) {
         new ConflictModal(this.app, this, plan.conflicts, lines).open();
       } else {
-        new ReportModal(this.app, lines.join("\n")).open();
+        // 结果写进日志，右上角给简短提示；不弹中心弹窗
+        for (const line of lines) this.log(line);
+        new Notice(
+          `⇅ 同步完成：拉取 ${downloaded}，推送 ${uploaded}${errors.length ? `，${errors.length} 个失败` : ""}`,
+          8000
+        );
       }
     } catch (err) {
       progress.hide();
       this.updateStatusBar("error", errMsg(err));
       const message = `同步中断：${errMsg(err)}`;
-      if (auto) new Notice(message, 10000);
-      else new ReportModal(this.app, message).open();
+      this.log(message);
+      new Notice(message, 10000);
     } finally {
       this.applying = false;
     }
@@ -874,39 +890,6 @@ class ConflictModal extends Modal {
     }
 
     const close = contentEl.createEl("button", { text: "关闭" });
-    close.addEventListener("click", () => this.close());
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-  }
-}
-
-class ReportModal extends Modal {
-  private report: string;
-
-  constructor(app: App, report: string) {
-    super(app);
-    this.report = report;
-  }
-
-  onOpen(): void {
-    const { contentEl } = this;
-    this.setTitle("局域网自检报告");
-    const pre = contentEl.createEl("pre", { cls: "lan-sync-report" });
-    pre.setText(this.report);
-
-    const buttons = contentEl.createDiv({ cls: "lan-sync-modal-buttons" });
-    const copy = buttons.createEl("button", { text: "复制报告" });
-    copy.addEventListener("click", async () => {
-      try {
-        await navigator.clipboard.writeText(this.report);
-        new Notice("已复制到剪贴板");
-      } catch {
-        new Notice("复制失败，请长按文本手动复制");
-      }
-    });
-    const close = buttons.createEl("button", { text: "关闭" });
     close.addEventListener("click", () => this.close());
   }
 
