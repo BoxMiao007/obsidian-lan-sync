@@ -2,7 +2,7 @@
 
 同一 Wi-Fi 下在电脑与手机之间同步 Obsidian 库，不经过任何云服务。
 
-## 当前状态：v0.3（双向同步，可用）
+## 当前状态：v0.5（双向同步，可用）
 
 - ✅ 桌面端 HTTP 服务（Obsidian 开着时监听，默认端口 28900）
 - ✅ 手机端与电脑端双向同步：内容哈希基线 + 4MB 分块传输 + 原子落盘
@@ -14,8 +14,10 @@
 - ✅ 冲突弹窗：逐条选「留电脑 / 留手机 / 两份都留」
 - ✅ 首次同步强制预览（干跑），覆盖/删除前自动备份到 `.trash/lan-sync-backup-*`
 - ✅ 自动同步开关：总开关 / 打开 app 同步 / 文件变更防抖 / 定时同步
-- ✅ 测试：core 16 项 + server 11 项 + e2e 5 项
-- ⏳ 待做：真机验证（手机端）、BRAT 发版（需要 GitHub 仓库）
+- ✅ 测试：core 21 项 + server 14 项 + e2e 12 项
+- ✅ 通知：一切结果走右上角提示，不弹中心弹窗；冲突与删除保护例外（必须交互确认）
+- ✅ 覆盖/删除前，本机与电脑端文件都会先备份到 `.trash/lan-sync-backup-*`
+- ⏳ 待做：手机端真机验证
 
 ## 架构约束（决定了它长什么样）
 
@@ -60,7 +62,7 @@
 ```bash
 pnpm install
 pnpm build        # 产出 main.js
-pnpm test         # core + server + e2e 共 31 项
+pnpm test         # core + server + e2e 共 47 项
 pnpm serve        # 单独启动服务端（诊断手机浏览器 vs Obsidian）
 ```
 
@@ -77,7 +79,7 @@ src/core/       同步核心（纯逻辑，可单测）
 src/net/remote.ts  手机端 HTTP 客户端（requestUrl）
 src/server.ts      桌面端 HTTP 服务（Node，函数内 require）
 src/client.ts      spike 自检用的请求/写盘探测
-src/main.ts        插件入口、命令、预览与报告弹窗
+src/main.ts        插件入口、命令、同步编排与通知
 src/settings.ts    设置页
 tests/             core / server / e2e
 ```

@@ -224,3 +224,55 @@ test("一次性下载 zip 且能解出三个文件", async () => {
   const denied = await fetch(`${base}/install/all.zip?token=000000`);
   assert.equal(denied.status, 401);
 });
+
+test("v1 备份：覆盖前把电脑端文件复制进 .trash，且拒绝非法目录", async () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const vault = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "lan-sync-bk-"));
+  fs.mkdirSync(path.join(vault, "notes"), { recursive: true });
+  fs.writeFileSync(path.join(vault, "notes", "a.md"), "原始内容");
+
+  const handle = await createSyncServer({
+    port: 39320,
+    token: TOKEN,
+    uploadDir: path.join(vault, ".tmp-upload"),
+    vaultDir: vault,
+    ignore: { configDir: ".obsidian", selfPluginId: "lan-sync" },
+    log: () => {},
+  });
+
+  try {
+    const base = `http://127.0.0.1:${handle.port}`;
+    const start = await fetch(`${base}/api/v1/session/start`, {
+      method: "POST",
+      headers: { "x-lan-sync-token": TOKEN },
+    });
+    const { sessionId } = await start.json();
+    const headers = { "x-lan-sync-token": TOKEN, "x-lan-sync-session": sessionId };
+
+    const ok = await fetch(`${base}/api/v1/backup`, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ paths: ["notes/a.md", "notes/missing.md"], folder: ".trash/lan-sync-backup-test" }),
+    });
+    assert.equal(ok.status, 200);
+    const body = await ok.json();
+    assert.equal(body.backedUp, 1, "只应备份存在的 1 个文件");
+    assert.deepEqual(body.skipped, ["notes/missing.md"]);
+    assert.equal(
+      fs.readFileSync(path.join(vault, ".trash/lan-sync-backup-test/notes/a.md"), "utf8"),
+      "原始内容"
+    );
+
+    const bad = await fetch(`${base}/api/v1/backup`, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      body: JSON.stringify({ paths: ["notes/a.md"], folder: "outside/dir" }),
+    });
+    assert.equal(bad.status, 500, "备份目录必须限制在 .trash 内");
+
+    await fetch(`${base}/api/v1/session/end?sessionId=${sessionId}`, { method: "POST", headers });
+  } finally {
+    await handle.close();
+  }
+});

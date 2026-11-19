@@ -189,6 +189,26 @@ export class HttpRemote {
       throw new Error(`删除远端失败：HTTP ${resp.status} ${resp.json?.error || ""}`.trim());
     }
   }
+
+  /** 让电脑端在覆盖/删除之前把文件备份到 .trash，返回实际备份数量。 */
+  async backupFiles(paths: string[], folder: string): Promise<number> {
+    if (paths.length === 0) return 0;
+    const resp = await withTimeout(
+      requestUrl({
+        url: `${this.base}/api/v1/backup`,
+        method: "POST",
+        headers: { ...this.headers(), "content-type": "application/json" },
+        body: JSON.stringify({ paths, folder }),
+        throw: false,
+      }),
+      60000,
+      "备份电脑端文件"
+    );
+    if (resp.status !== 200) {
+      throw new Error(`备份电脑端失败：HTTP ${resp.status} ${resp.json?.error || ""}`.trim());
+    }
+    return Number(resp.json?.backedUp) || 0;
+  }
 }
 
 export function joinUrl(base: string, path: string): string {

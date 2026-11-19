@@ -20,7 +20,7 @@ import {
 import { createSyncServer, type SyncServerHandle } from "./server";
 import { DEFAULT_SETTINGS, LanSyncSettingTab, type LanSyncSettings } from "./settings";
 import { buildManifest } from "./core/manifest";
-import { planSync, summarizePlan, type SyncPlan, type ConflictItem, type ChangeItem } from "./core/plan";
+import { planSync, planHasWork, requiresConfirmation, summarizePlan, type SyncPlan, type ConflictItem } from "./core/plan";
 import { emptyBaseline, type Baseline, type FileEntry } from "./core/types";
 import { applyPullPlan, applyPushPlan, applyConflictChoice } from "./core/engine";
 import { HttpRemote } from "./net/remote";
@@ -36,10 +36,13 @@ export default class LanSyncPlugin extends Plugin {
   private syncRunning = false;
   private applying = false;
   private lastSyncAt = 0;
-  private debounceTimer: number | null = null;
+  /** 所有自动触发共用的唯一定时器：合并启动/回前台/变更/定时，天然去重 */
+  private autoSyncTimer: number | null = null;
+  /** 同步进行中又被触发：结束后补跑一次，避免丢失真实编辑 */
+  private pendingAutoSync = false;
+  private syncState: "idle" | "syncing" | "ok" | "error" = "idle";
   private ribbonEl: HTMLElement | null = null;
   private statusBarEl: HTMLElement | null = null;
-  private syncState: "idle" | "syncing" | "ok" | "error" = "idle";
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -93,50 +96,64 @@ export default class LanSyncPlugin extends Plugin {
     this.registerTriggers();
   }
 
-  /** 注册自动同步触发器。改设置不需要重注册：处理器每次都读当前设置。 */
+  /** 注册自动同步触发器。所有触发都汇入同一个定时器：启动与回前台不再各跑一次，真实编辑也不会被丢掉。 */
   private registerTriggers(): void {
-    // 回到前台时同步一次（手机端最可靠的触发时机）
+    if (this.settings.syncOnOpen) {
+      this.scheduleAutoSync(3000);
+    }
+
+    // 回到前台：和启动触发共用同一个定时器，谁后到谁覆盖，最终只跑一次
     const onVisibility = () => {
       if (document.visibilityState !== "visible") return;
-      if (!this.settings.syncEnabled) return;
-      const gap = Date.now() - this.lastSyncAt;
-      if (gap < 60_000) return;
-      void this.runSync(true);
+      if (Date.now() - this.lastSyncAt < 60_000) return;
+      this.scheduleAutoSync(500);
     };
     document.addEventListener("visibilitychange", onVisibility);
     this.register(() => document.removeEventListener("visibilitychange", onVisibility));
 
-    if (this.settings.syncOnOpen) {
-      window.setTimeout(() => void this.runSync(true), 3000);
-    }
-
+    // 文件变更：防抖后排队；若正在同步，只标记待跑，结束后补一次（不丢编辑）
     const onVaultChange = () => {
       if (!this.settings.syncEnabled || this.settings.syncDebounceSeconds <= 0) return;
-      if (this.syncRunning || this.applying) return;
-      if (this.debounceTimer) window.clearTimeout(this.debounceTimer);
-      this.debounceTimer = window.setTimeout(() => {
-        this.debounceTimer = null;
-        void this.runSync(true);
-      }, this.settings.syncDebounceSeconds * 1000);
+      if (this.syncRunning || this.applying) {
+        this.pendingAutoSync = true;
+        return;
+      }
+      this.scheduleAutoSync(this.settings.syncDebounceSeconds * 1000);
     };
-
     this.registerEvent(this.app.vault.on("modify", onVaultChange));
     this.registerEvent(this.app.vault.on("create", onVaultChange));
     this.registerEvent(this.app.vault.on("delete", onVaultChange));
     this.registerEvent(this.app.vault.on("rename", onVaultChange));
 
-    // 定时同步：每分钟检查一次，避免频繁重建 timer
+    // 定时同步：每分钟检查一次，到了间隔才排队
     this.registerInterval(
       window.setInterval(() => {
         if (!this.settings.syncEnabled || this.settings.syncIntervalMinutes <= 0) return;
-        if (this.syncRunning) return;
         if (Date.now() - this.lastSyncAt < this.settings.syncIntervalMinutes * 60_000) return;
-        void this.runSync(true);
+        this.scheduleAutoSync(0);
       }, 60_000)
     );
   }
 
+  /** 自动同步唯一入口：多次触发只保留最后一次；正在同步时标记待跑而不是丢弃。 */
+  private scheduleAutoSync(delayMs: number): void {
+    if (!this.settings.syncEnabled) return;
+    if (this.syncRunning || this.applying) {
+      this.pendingAutoSync = true;
+      return;
+    }
+    if (this.autoSyncTimer) window.clearTimeout(this.autoSyncTimer);
+    this.autoSyncTimer = window.setTimeout(() => {
+      this.autoSyncTimer = null;
+      void this.runSync(true);
+    }, delayMs);
+  }
+
   async onunload(): Promise<void> {
+    if (this.autoSyncTimer) {
+      window.clearTimeout(this.autoSyncTimer);
+      this.autoSyncTimer = null;
+    }
     await this.stopServer();
   }
 
@@ -264,9 +281,7 @@ export default class LanSyncPlugin extends Plugin {
     } catch (err) {
       this.selfTestRunning = false;
       notice.hide();
-      const message = `自检失败：${errMsg(err)}`;
-      this.log(message);
-      new Notice(message, 10000);
+      this.notifyError("自检失败", err);
       return;
     }
 
@@ -355,12 +370,13 @@ export default class LanSyncPlugin extends Plugin {
 
   async runSync(auto = false): Promise<void> {
     // 自动同步有多个触发源（打开 app / 回到前台 / 文件变更 / 定时），
-    // 它们可能在几秒内同时触发。这里做最小间隔节流，避免重复同步和重复提示。
-    // 手动点击（auto=false）不受限制，随时可以强制同步。
-    if (auto && Date.now() - this.lastSyncAt < 15_000) return;
-
+    // 同一时刻只跑一个同步；自动触发被撞上就记为待跑，结束后补一次（真实编辑不丢）
     if (this.syncRunning) {
-      if (!auto) new Notice("同步正在进行，请稍候…");
+      if (auto) {
+        this.pendingAutoSync = true;
+        return;
+      }
+      new Notice("同步正在进行，请稍候…");
       return;
     }
     let target: Target;
@@ -414,18 +430,24 @@ export default class LanSyncPlugin extends Plugin {
         `同步预览（${this.settings.syncMode}）：本机 ${local.entries.length} / 电脑 ${remoteManifest.entries.length} → ${summarizePlan(plan)}`
       );
 
-      const hasWork =
-        plan.downloads.length + plan.uploads.length + plan.deleteLocal.length + plan.deleteRemote.length > 0;
+      const hasWork = planHasWork(plan);
       if (!hasWork) {
         this.updateStatusBar("ok");
         new Notice("两端一致，没有需要同步的改动。", 4000);
         return;
       }
 
+      // 首次同步 / 有冲突 / 触发删除熔断：必须用户确认，自动同步绝不擅自写入
+      const confirm = requiresConfirmation(plan, baseline);
+      if (auto && confirm.required) {
+        new Notice(`⏸ 已暂停自动同步：${confirm.reason}。请点侧栏 ⇅ 按钮预览并确认后执行。`, 12000);
+        this.updateStatusBar("idle");
+        return;
+      }
+
       if (auto) {
-        // 启动/后台自动同步：一律用右上角小提示，不弹中心弹窗打断用户。
-        // 首次同步按用户配置的策略处理；熔断计划会被 applySync 内部拒绝并只在提示里说明原因。
-        await this.applySync(plan, remoteClient, remoteManifest.entries, baseline, true);
+        const outcome = await this.applySync(plan, remoteClient, remoteManifest.entries, baseline);
+        this.presentOutcome(outcome, true);
         return;
       }
 
@@ -435,30 +457,36 @@ export default class LanSyncPlugin extends Plugin {
         remoteCount: remoteManifest.entries.length,
         firstSync: baseline.updatedAt === 0,
         mode: this.settings.syncMode,
-        onConfirm: () => this.applySync(plan, remoteClient, remoteManifest.entries, baseline),
+        onConfirm: async () => {
+          const outcome = await this.applySync(plan, remoteClient, remoteManifest.entries, baseline);
+          this.presentOutcome(outcome, false);
+        },
       }).open();
     } catch (err) {
       notice.hide();
       this.updateStatusBar("error", errMsg(err));
-      const message = `同步失败：${errMsg(err)}`;
-      this.log(message);
-      new Notice(message, 10000);
+      this.notifyError("同步失败", err);
     } finally {
       if (remote) await remote.endSession();
       this.syncRunning = false;
       this.lastSyncAt = Date.now();
       // 如果还没进入写入阶段（比如只是预览），把状态回落；错误状态保留
       if (this.syncState === "syncing") this.updateStatusBar("idle");
+      // 同步期间又有真实变更：补跑一次
+      if (this.pendingAutoSync) {
+        this.pendingAutoSync = false;
+        this.scheduleAutoSync(0);
+      }
     }
   }
 
+  /** 执行同步计划并返回结构化结果；不做任何提示，展示交给 presentOutcome。 */
   private async applySync(
     plan: SyncPlan,
     remote: HttpRemote,
     remoteEntries: FileEntry[],
-    baseline: Baseline,
-    auto = false
-  ): Promise<void> {
+    baseline: Baseline
+  ): Promise<SyncOutcome> {
     const adapter: any = this.app.vault.adapter;
     const progress = new Notice("开始同步…", 0);
     this.applying = true;
@@ -472,16 +500,34 @@ export default class LanSyncPlugin extends Plugin {
     };
 
     try {
-      // 覆盖/删除本机文件之前先备份到 .trash（同步忽略 .trash）
-      const backupTargets: string[] = [...plan.deleteLocal];
+      const remotePathSet = new Set(remoteEntries.map((entry) => entry.path));
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const backupFolder = `.trash/lan-sync-backup-${stamp}`;
+
+      // 覆盖/删除本机文件之前先备份（.trash 本身被同步忽略）
+      const localBackupTargets: string[] = [...plan.deleteLocal];
       for (const item of plan.downloads) {
-        if (await adapter.exists(item.path)) backupTargets.push(item.path);
+        if (await adapter.exists(item.path)) localBackupTargets.push(item.path);
       }
+      // 覆盖/删除电脑端文件之前也要备份，否则「已备份」只保住了本机这一半
+      const remoteBackupTargets: string[] = [
+        ...plan.deleteRemote,
+        ...plan.uploads.filter((item) => remotePathSet.has(item.path)).map((item) => item.path),
+      ];
+
       let backedUp = 0;
-      if (backupTargets.length) {
-        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-        progress.setMessage(`正在备份 ${backupTargets.length} 个将被覆盖/删除的文件…`);
-        backedUp = await this.backupFiles(backupTargets, `.trash/lan-sync-backup-${stamp}`);
+      if (localBackupTargets.length) {
+        progress.setMessage(`正在备份本机 ${localBackupTargets.length} 个将被覆盖/删除的文件…`);
+        backedUp += await this.backupFiles(localBackupTargets, backupFolder);
+      }
+      if (remoteBackupTargets.length) {
+        progress.setMessage(`正在备份电脑端 ${remoteBackupTargets.length} 个将被覆盖/删除的文件…`);
+        try {
+          backedUp += await remote.backupFiles(remoteBackupTargets, backupFolder);
+        } catch (err) {
+          // 电脑端备份失败就不冒险继续覆盖，直接中止本次同步
+          throw new Error(`电脑端备份失败，已中止同步：${errMsg(err)}`);
+        }
       }
 
       let current = baseline;
@@ -533,10 +579,11 @@ export default class LanSyncPlugin extends Plugin {
         "LAN Sync · 同步结果",
         `拉取：${downloaded} 个（${formatBytes(downloadedBytes)}），删除本机 ${deletedLocal} 个`,
         `推送：${uploaded} 个（${formatBytes(uploadedBytes)}），删除电脑 ${deletedRemote} 个`,
-        `已备份：${backedUp} 个（.trash/lan-sync-backup-*）`,
+        `已备份：${backedUp} 个（${backupFolder}）`,
         `冲突未处理：${plan.conflicts.length} 个`,
         `跳过：${plan.skipped.length} 个`,
       ];
+      if (plan.breaker) lines.push("", `⛔ ${plan.breaker.message}`);
       if (errors.length) {
         lines.push("", `失败 ${errors.length} 个：`);
         for (const item of errors.slice(0, 20)) lines.push(`  ✗ ${item.path}：${item.message}`);
@@ -545,44 +592,75 @@ export default class LanSyncPlugin extends Plugin {
         lines.push("", "冲突文件（两端都改过，本次保持原样）：");
         for (const item of plan.conflicts.slice(0, 20)) lines.push(`  ⚠ ${item.path}（${item.reason}）`);
       }
-      this.log(
-        `同步完成：拉取 ${downloaded}，推送 ${uploaded}，错误 ${errors.length}`
-      );
-      this.updateStatusBar(errors.length ? "error" : "ok", errors.length ? `${errors.length} 个文件失败` : "");
       if (selfUpdated) {
-        lines.push("", "⚠ 本插件的程序文件已更新，需要重启 Obsidian（或在插件列表里关闭再启用）才会生效。");
+        lines.push("", "⚠ 本插件的程序文件已更新，需要重启 Obsidian 才会生效。");
       }
-      if (auto) {
-        // 自动同步只在右上角提示，不弹中心弹窗；详情仍写入运行日志
-        const bits = [`拉取 ${downloaded}`, `推送 ${uploaded}`];
-        if (errors.length) bits.push(`${errors.length} 个失败`);
-        if (plan.conflicts.length) bits.push(`${plan.conflicts.length} 个冲突`);
-        new Notice(`⇅ 同步完成：${bits.join(" · ")}`, 8000);
-        if (plan.conflicts.length) {
-          new Notice(`有 ${plan.conflicts.length} 个冲突未处理，点侧栏 ⇅ 按钮可逐条处理。`, 10000);
-        }
-        if (selfUpdated) {
-          new Notice("局域网同步插件文件已更新，请重启 Obsidian 生效。", 12000);
-        }
-      } else if (plan.conflicts.length) {
-        new ConflictModal(this.app, this, plan.conflicts, lines).open();
-      } else {
-        // 结果写进日志，右上角给简短提示；不弹中心弹窗
-        for (const line of lines) this.log(line);
-        new Notice(
-          `⇅ 同步完成：拉取 ${downloaded}，推送 ${uploaded}${errors.length ? `，${errors.length} 个失败` : ""}`,
-          8000
-        );
-      }
+
+      return {
+        downloaded,
+        downloadedBytes,
+        deletedLocal,
+        uploaded,
+        uploadedBytes,
+        deletedRemote,
+        backedUp,
+        errors,
+        conflictItems: plan.conflicts,
+        skipped: plan.skipped.length,
+        selfUpdated,
+        breaker: plan.breaker ? plan.breaker.message : null,
+        lines,
+      };
     } catch (err) {
       progress.hide();
-      this.updateStatusBar("error", errMsg(err));
-      const message = `同步中断：${errMsg(err)}`;
-      this.log(message);
-      new Notice(message, 10000);
+      throw err;
     } finally {
       this.applying = false;
     }
+  }
+
+  /** 统一展示入口：一次同步只产生一条最终提示；熔断明确说明已中止；冲突必须交互三选一。 */
+  private presentOutcome(outcome: SyncOutcome, auto: boolean): void {
+    for (const line of outcome.lines) this.log(line);
+    this.updateStatusBar(
+      outcome.errors.length || outcome.breaker ? "error" : "ok",
+      outcome.errors.length ? `${outcome.errors.length} 个文件失败` : ""
+    );
+
+    if (outcome.breaker) {
+      new Notice(`⛔ 同步已中止（删除保护）：${outcome.breaker}`, 15000);
+      return;
+    }
+
+    // 冲突不能静默：即使自动同步也必须由用户决定保留哪一份
+    if (outcome.conflictItems.length > 0) {
+      new ConflictModal(this.app, this, outcome.conflictItems, outcome.lines).open();
+      return;
+    }
+
+    const parts: string[] = [];
+    if (outcome.downloaded) parts.push(`拉取 ${outcome.downloaded}`);
+    if (outcome.uploaded) parts.push(`推送 ${outcome.uploaded}`);
+    if (outcome.deletedLocal) parts.push(`删除本机 ${outcome.deletedLocal}`);
+    if (outcome.deletedRemote) parts.push(`删除电脑 ${outcome.deletedRemote}`);
+    const detail = parts.length ? parts.join(" · ") : "无改动";
+
+    let text: string;
+    if (outcome.errors.length) {
+      text = `⇅ 同步完成，但有 ${outcome.errors.length} 个文件失败：${detail}（详见运行日志）`;
+    } else {
+      text = `⇅ ${auto ? "后台同步" : "同步完成"}：${detail}`;
+    }
+    if (outcome.selfUpdated) text += "；插件文件已更新，需重启 Obsidian";
+
+    new Notice(text, outcome.errors.length ? 12000 : 6000);
+  }
+
+  /** 错误提示统一入口：三处调用格式一致，且一定写入运行日志。 */
+  private notifyError(prefix: string, err: unknown): void {
+    const message = `${prefix}：${errMsg(err)}`;
+    this.log(message);
+    new Notice(message, 10000);
   }
 
   /** 冲突的三个处理方式：留电脑 / 留手机 / 两份都留。 */
@@ -718,6 +796,22 @@ function summarize(results: StepResult[]): string {
   return "全部通过：明文 HTTP 可用，分块传输与落盘都正常，可以进入正式实现。";
 }
 
+interface SyncOutcome {
+  downloaded: number;
+  downloadedBytes: number;
+  deletedLocal: number;
+  uploaded: number;
+  uploadedBytes: number;
+  deletedRemote: number;
+  backedUp: number;
+  errors: Array<{ path: string; message: string }>;
+  conflictItems: ConflictItem[];
+  skipped: number;
+  selfUpdated: boolean;
+  breaker: string | null;
+  lines: string[];
+}
+
 interface SyncPreviewOptions {
   plan: SyncPlan;
   localCount: number;
@@ -799,26 +893,6 @@ function appendSection(lines: string[], title: string, items: string[]): void {
   for (const item of items.slice(0, 30)) lines.push(`  ${item}`);
   if (items.length > 30) lines.push(`  …还有 ${items.length - 30} 项`);
   lines.push("");
-}
-
-function singlePlan(parts: {
-  downloads?: ChangeItem[];
-  uploads?: ChangeItem[];
-  deleteLocal?: string[];
-  deleteRemote?: string[];
-}): SyncPlan {
-  return {
-    downloads: parts.downloads ?? [],
-    uploads: parts.uploads ?? [],
-    deleteLocal: parts.deleteLocal ?? [],
-    deleteRemote: parts.deleteRemote ?? [],
-    conflicts: [],
-    skipped: [],
-    unchanged: 0,
-    unchangedPaths: [],
-    breaker: null,
-    totals: { localFiles: 0, remoteFiles: 0 },
-  };
 }
 
 function conflictCopyPath(path: string): string {

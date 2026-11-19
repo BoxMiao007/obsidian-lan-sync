@@ -608,6 +608,40 @@ document.getElementById("test").addEventListener("click", async () => {
           return;
         }
 
+        // 覆盖/删除前把电脑端文件复制到 .trash（备份目录本身被同步忽略）
+        if (pathname === "/api/v1/backup" && req.method === "POST") {
+          requireSession();
+          if (!opts.vaultDir) throw new Error("服务端未配置 vaultDir");
+          const body = await readBody(req, 1024 * 1024);
+          const info = JSON.parse(body.toString("utf8") || "{}");
+          const folder = String(info.folder || "").replace(/\\/g, "/");
+          if (!folder.startsWith(".trash/") || folder.includes("..")) {
+            throw new Error("备份目录不合法");
+          }
+          const folderAbs = resolveVaultFile(folder);
+          if (!folderAbs) throw new Error("备份目录不合法");
+          const skipped: string[] = [];
+          let backedUp = 0;
+          for (const raw of Array.isArray(info.paths) ? info.paths : []) {
+            const rel = String(raw || "").replace(/\\/g, "/");
+            if (!rel || rel.includes("..")) {
+              skipped.push(rel);
+              continue;
+            }
+            const src = resolveVaultFile(rel);
+            if (!src || !fs.existsSync(src) || !fs.statSync(src).isFile()) {
+              skipped.push(rel);
+              continue;
+            }
+            const dest = path.join(folderAbs, rel);
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            fs.copyFileSync(src, dest);
+            backedUp++;
+          }
+          sendJson(200, { ok: true, backedUp, skipped });
+          return;
+        }
+
         // 下载测试：返回确定性伪随机数据，支持任意 offset/len（为正式分块传输铺路）。
         if (pathname === "/api/blob" && req.method === "GET") {
           const mb = clampInt(parseInt(url.searchParams.get("mb") || "1", 10) || 1, 1, MAX_BLOB_MB);

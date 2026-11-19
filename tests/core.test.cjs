@@ -319,3 +319,41 @@ test("计划：首次同步可选「以电脑为准」批量覆盖", () => {
   assert.deepEqual(preferLocal.uploads.map((u) => u.path), ["a.md"]);
   assert.equal(preferLocal.conflicts.length, 0);
 });
+
+test("自动同步确认策略：首次/冲突/熔断必须确认", () => {
+  const { requiresConfirmation, planHasWork } = require("../dist/core.cjs");
+
+  // 首次同步（基线为空）→ 必须确认
+  const firstPlan = planSync([], [entry("a.md", "x")], emptyBaseline(), { mode: "both" });
+  const first = requiresConfirmation(firstPlan, emptyBaseline());
+  assert.equal(first.required, true);
+  assert.match(first.reason, /首次同步/);
+
+  // 有冲突 → 必须确认（即使基线存在）
+  const base = { ...baseOf({ "a.md": "v1" }), updatedAt: 1 };
+  const conflictPlan = planSync([entry("a.md", "l2")], [entry("a.md", "r2")], base, { mode: "both" });
+  const conflict = requiresConfirmation(conflictPlan, base);
+  assert.equal(conflict.required, true);
+  assert.match(conflict.reason, /冲突/);
+
+  // 熔断 → 必须确认
+  const many = baseOf({});
+  const localMany = [];
+  for (let i = 0; i < 25; i++) {
+    many.entries[`f${i}.md`] = { size: 10, sha256: "v1" };
+    localMany.push(entry(`f${i}.md`, "v1"));
+  }
+  const breakerPlan = planSync(localMany, [], many, { mode: "both" });
+  assert.ok(breakerPlan.breaker);
+  assert.equal(requiresConfirmation(breakerPlan, many).required, true);
+
+  // 普通增量 → 不需要确认
+  const normal = planSync([entry("a.md", "v1")], [entry("a.md", "v2")], base, { mode: "both" });
+  assert.equal(requiresConfirmation(normal, base).required, false);
+  assert.equal(planHasWork(normal), true);
+
+  // 只有冲突也算有工作（旧 bug：会被误判「两端一致」）
+  const onlyConflict = planSync([entry("c.md", "l")], [entry("c.md", "r")], emptyBaseline(), { mode: "both" });
+  assert.equal(onlyConflict.downloads.length + onlyConflict.uploads.length, 0);
+  assert.equal(planHasWork(onlyConflict), true, "只有冲突时不能被当成没有改动");
+});

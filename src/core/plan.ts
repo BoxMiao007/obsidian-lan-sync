@@ -255,6 +255,35 @@ export function updateBaseline(
   return { version: 1, updatedAt: now, entries };
 }
 
+/**
+ * 自动同步是否可以不经确认直接执行。
+ * 首次同步（基线为空）、存在冲突、或触发删除熔断时必须让用户确认——
+ * 无人值守的自动同步绝不能在这些情况下擅自写文件。
+ */
+export function requiresConfirmation(
+  plan: SyncPlan,
+  baseline: Baseline
+): { required: boolean; reason: string | null } {
+  if (plan.breaker) return { required: true, reason: "触发删除保护" };
+  if (plan.conflicts.length > 0) {
+    return { required: true, reason: `有 ${plan.conflicts.length} 个冲突待处理` };
+  }
+  if (baseline.updatedAt === 0) return { required: true, reason: "这是首次同步，需要先确认" };
+  return { required: false, reason: null };
+}
+
+/** 计划里是否有任何需要处理的动作（冲突也算）。 */
+export function planHasWork(plan: SyncPlan): boolean {
+  return (
+    plan.downloads.length +
+      plan.uploads.length +
+      plan.deleteLocal.length +
+      plan.deleteRemote.length +
+      plan.conflicts.length >
+    0
+  );
+}
+
 export function summarizePlan(plan: SyncPlan): string {
   const parts = [
     `下载 ${plan.downloads.length}`,

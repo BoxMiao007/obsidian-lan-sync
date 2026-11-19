@@ -441,8 +441,30 @@ export class LanSyncSettingTab extends PluginSettingTab {
   private renderLogSection(parent: HTMLElement): void {
     const card = parent.createDiv({ cls: "lan-sync-card" });
     card.createEl("h3", { text: "运行日志" });
+    card.createEl("p", {
+      cls: "lan-sync-muted",
+      text: "同步结果、自检报告与错误原因都在这里。完整报告超出下面的显示范围时，用「复制日志」取全文。",
+    });
     this.logEl = card.createEl("pre", { cls: "lan-sync-log" });
     this.refreshLog();
+    new Setting(card)
+      .setName("复制日志")
+      .setDesc("复制最近 200 行到剪贴板，便于反馈问题。")
+      .addButton((btn) =>
+        btn.setButtonText("复制").onClick(async () => {
+          const text = this.plugin.logs.slice(-200).join("\n");
+          if (!text) {
+            new Notice("暂无日志");
+            return;
+          }
+          try {
+            await navigator.clipboard.writeText(text);
+            new Notice(`已复制 ${Math.min(this.plugin.logs.length, 200)} 行日志`);
+          } catch {
+            new Notice("复制失败，请长按日志手动选择复制");
+          }
+        })
+      );
     new Setting(card)
       .setName("临时文件")
       .setDesc("自检会在 .obsidian/plugins/lan-sync/tmp 下写测试文件，可随时清理。")
@@ -455,6 +477,6 @@ export class LanSyncSettingTab extends PluginSettingTab {
 
   refreshLog(): void {
     if (!this.logEl) return;
-    this.logEl.setText(this.plugin.logs.slice(-12).join("\n") || "（暂无日志）");
+    this.logEl.setText(this.plugin.logs.slice(-60).join("\n") || "（暂无日志）");
   }
 }
