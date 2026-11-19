@@ -406,10 +406,10 @@ export default class LanSyncPlugin extends Plugin {
         return;
       }
 
-      const mustPreview = !auto || baseline.updatedAt === 0 || Boolean(plan.breaker) || plan.conflicts.length > 0;
-      if (!mustPreview) {
-        // 自动同步：无人值守时不弹预览，直接应用（首次同步 / 冲突 / 熔断仍然会弹）
-        await this.applySync(plan, remoteClient, remoteManifest.entries, baseline);
+      if (auto) {
+        // 启动/后台自动同步：一律用右上角小提示，不弹中心弹窗打断用户。
+        // 首次同步按用户配置的策略处理；熔断计划会被 applySync 内部拒绝并只在提示里说明原因。
+        await this.applySync(plan, remoteClient, remoteManifest.entries, baseline, true);
         return;
       }
 
@@ -424,7 +424,9 @@ export default class LanSyncPlugin extends Plugin {
     } catch (err) {
       notice.hide();
       this.updateStatusBar("error", errMsg(err));
-      new ReportModal(this.app, `同步失败：${errMsg(err)}`).open();
+      const message = `同步失败：${errMsg(err)}`;
+      if (auto) new Notice(message, 10000);
+      else new ReportModal(this.app, message).open();
     } finally {
       if (remote) await remote.endSession();
       this.syncRunning = false;
@@ -438,7 +440,8 @@ export default class LanSyncPlugin extends Plugin {
     plan: SyncPlan,
     remote: HttpRemote,
     remoteEntries: FileEntry[],
-    baseline: Baseline
+    baseline: Baseline,
+    auto = false
   ): Promise<void> {
     const adapter: any = this.app.vault.adapter;
     const progress = new Notice("开始同步…", 0);
@@ -533,7 +536,19 @@ export default class LanSyncPlugin extends Plugin {
       if (selfUpdated) {
         lines.push("", "⚠ 本插件的程序文件已更新，需要重启 Obsidian（或在插件列表里关闭再启用）才会生效。");
       }
-      if (plan.conflicts.length) {
+      if (auto) {
+        // 自动同步只在右上角提示，不弹中心弹窗；详情仍写入运行日志
+        const bits = [`拉取 ${downloaded}`, `推送 ${uploaded}`];
+        if (errors.length) bits.push(`${errors.length} 个失败`);
+        if (plan.conflicts.length) bits.push(`${plan.conflicts.length} 个冲突`);
+        new Notice(`⇅ 同步完成：${bits.join(" · ")}`, 8000);
+        if (plan.conflicts.length) {
+          new Notice(`有 ${plan.conflicts.length} 个冲突未处理，点侧栏 ⇅ 按钮可逐条处理。`, 10000);
+        }
+        if (selfUpdated) {
+          new Notice("局域网同步插件文件已更新，请重启 Obsidian 生效。", 12000);
+        }
+      } else if (plan.conflicts.length) {
         new ConflictModal(this.app, this, plan.conflicts, lines).open();
       } else {
         new ReportModal(this.app, lines.join("\n")).open();
@@ -541,7 +556,9 @@ export default class LanSyncPlugin extends Plugin {
     } catch (err) {
       progress.hide();
       this.updateStatusBar("error", errMsg(err));
-      new ReportModal(this.app, `同步中断：${errMsg(err)}`).open();
+      const message = `同步中断：${errMsg(err)}`;
+      if (auto) new Notice(message, 10000);
+      else new ReportModal(this.app, message).open();
     } finally {
       this.applying = false;
     }
