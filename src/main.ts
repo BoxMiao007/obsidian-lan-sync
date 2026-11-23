@@ -20,10 +20,13 @@ import {
 import { createSyncServer, type SyncServerHandle } from "./server";
 import { DEFAULT_SETTINGS, LanSyncSettingTab, type LanSyncSettings } from "./settings";
 import { buildManifest } from "./core/manifest";
+import type { HashCacheEntry } from "./core/manifest";
 import { planSync, planHasWork, requiresConfirmation, summarizePlan, type SyncPlan, type ConflictItem } from "./core/plan";
 import { emptyBaseline, type Baseline, type FileEntry } from "./core/types";
-import { applyPullPlan, applyPushPlan, applyConflictChoice } from "./core/engine";
-import { HttpRemote } from "./net/remote";
+import { applyPullPlan, applyPushPlan, applyConflictChoice, applyKeepBothLocalWins } from "./core/engine";
+import { HttpRemote, type SyncRemote } from "./net/remote";
+import { createWebDavRemote } from "./net/webdav";
+import type { RemoteCacheEntry } from "./net/webdav-protocol";
 import type { IgnoreConfig } from "./core/ignore";
 import { isIgnored } from "./core/ignore";
 
@@ -44,9 +47,14 @@ export default class LanSyncPlugin extends Plugin {
   private syncState: "idle" | "syncing" | "ok" | "error" = "idle";
   private ribbonEl: HTMLElement | null = null;
   private statusBarEl: HTMLElement | null = null;
+  /** 本地哈希缓存（mtime+size → sha256），加速扫描、支撑轻量预检 */
+  private localHashCache = new Map<string, HashCacheEntry>();
+  /** 远端（WebDAV）哈希缓存（ETag 令牌 → sha256） */
+  private remoteHashCache = new Map<string, RemoteCacheEntry>();
 
   async onload(): Promise<void> {
     await this.loadSettings();
+    await this.loadSyncCaches();
     this.settingsTab = new LanSyncSettingTab(this.app, this);
     this.addSettingTab(this.settingsTab);
 
@@ -172,6 +180,10 @@ export default class LanSyncPlugin extends Plugin {
       this.settings.clientToken = this.settings.token;
       await this.saveSettings();
     }
+    if (!this.settings.deviceId) {
+      this.settings.deviceId = randomDeviceId();
+      await this.saveSettings();
+    }
   }
 
   async saveSettings(): Promise<void> {
@@ -220,6 +232,106 @@ export default class LanSyncPlugin extends Plugin {
     const adapter: any = this.app.vault.adapter;
     const path = `${this.pluginDir()}/baseline.json`;
     await adapter.write(path, JSON.stringify(baseline));
+  }
+
+  private maxHashBytes(): number {
+    return 24 * 1024 * 1024;
+  }
+
+  private chunkBytes(): number {
+    return Math.max(0.25, this.settings.chunkMB) * 1024 * 1024;
+  }
+
+  private deviceName(): string {
+    return Platform.isMobileApp ? "手机" : "电脑";
+  }
+
+  private isWebDavConfigured(): boolean {
+    if (!this.settings.webdavEnabled) return false;
+    // 手机端 host 可留空（走 127.0.0.1，本机就是 WebDAV 宿主）；电脑端必须填手机 IP
+    if (Platform.isDesktopApp && !this.settings.webdavHost.trim()) return false;
+    return true;
+  }
+
+  private webdavBase(): string {
+    const raw = this.settings.webdavHost.trim() || (Platform.isMobileApp ? "127.0.0.1" : "");
+    const clean = raw.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    const proto = this.settings.webdavHttps ? "https" : "http";
+    return `${proto}://${clean}:${this.settings.webdavPort}`;
+  }
+
+  private webdavRoot(): string {
+    const configured = (this.settings.webdavRoot || "").trim();
+    if (configured) return configured.replace(/^\/+|\/+$/g, "");
+    const name = String(this.app.vault.getName?.() || "vault").replace(/[\\/:*?"<>|]/g, "_");
+    return `lansync/${name}`;
+  }
+
+  private webdavConfig() {
+    return {
+      baseUrl: this.webdavBase(),
+      root: this.webdavRoot(),
+      user: this.settings.webdavUser,
+      pass: this.settings.webdavPassword,
+      deviceId: this.settings.deviceId,
+      deviceName: this.deviceName(),
+      ignore: this.ignoreConfig(),
+      chunkBytes: this.chunkBytes(),
+      maxHashBytes: this.maxHashBytes(),
+      timeoutMs: 30000,
+    };
+  }
+
+  /** 选择传输：WebDAV 优先；手机端连不上时退回直连电脑 HTTP 服务。 */
+  private async openRemote(): Promise<{ remote: SyncRemote; label: string }> {
+    const wantWebdav = this.settings.transport !== "server";
+    if (wantWebdav && this.isWebDavConfigured()) {
+      try {
+        const wd = createWebDavRemote(this.webdavConfig(), this.remoteHashCache);
+        await (wd as any).probe?.();
+        return { remote: wd, label: "WebDAV" };
+      } catch (err) {
+        this.log(`WebDAV 不可用：${errMsg(err)}`);
+        if (this.settings.transport === "webdav") throw new Error(`WebDAV 不可用：${errMsg(err)}`);
+        if (Platform.isMobileApp && this.settings.clientHost.trim()) {
+          const target = this.resolveTarget();
+          this.log(`改用电脑直连兜底：${target.base}`);
+          return { remote: new HttpRemote(target.base, target.token, this.chunkBytes()), label: "电脑直连(兜底)" };
+        }
+        throw new Error(`WebDAV 不可用，且没有可用的电脑兜底：${errMsg(err)}`);
+      }
+    }
+    const target = this.resolveTarget();
+    return { remote: new HttpRemote(target.base, target.token, this.chunkBytes()), label: "电脑直连" };
+  }
+
+  async loadSyncCaches(): Promise<void> {
+    const adapter: any = this.app.vault.adapter;
+    const path = `${this.pluginDir()}/sync-cache.json`;
+    try {
+      if (!(await adapter.exists(path))) return;
+      const raw = JSON.parse(await adapter.read(path));
+      for (const [k, v] of Object.entries(raw?.local || {})) this.localHashCache.set(k, v as HashCacheEntry);
+      for (const [k, v] of Object.entries(raw?.remote || {})) this.remoteHashCache.set(k, v as RemoteCacheEntry);
+    } catch (err) {
+      this.log(`读取同步缓存失败，忽略：${errMsg(err)}`);
+    }
+  }
+
+  async saveSyncCaches(): Promise<void> {
+    const adapter: any = this.app.vault.adapter;
+    const path = `${this.pluginDir()}/sync-cache.json`;
+    try {
+      await adapter.write(
+        path,
+        JSON.stringify({
+          local: Object.fromEntries(this.localHashCache),
+          remote: Object.fromEntries(this.remoteHashCache),
+        })
+      );
+    } catch (err) {
+      this.log(`写入同步缓存失败：${errMsg(err)}`);
+    }
   }
 
   async startServer(): Promise<void> {
@@ -384,42 +496,37 @@ export default class LanSyncPlugin extends Plugin {
       new Notice("同步正在进行，请稍候…");
       return;
     }
-    let target: Target;
-    try {
-      target = this.resolveTarget();
-    } catch (err) {
-      if (auto) this.log(`自动同步跳过：${errMsg(err)}`);
-      else new Notice(errMsg(err));
-      return;
-    }
-
     this.syncRunning = true;
     this.updateStatusBar("syncing");
-    const notice = new Notice("正在扫描本机文件…", 0);
-    let remote: HttpRemote | null = null;
+    const notice = new Notice("正在连接…", 0);
+    let remote: SyncRemote | null = null;
     try {
+      const opened = await this.openRemote();
+      remote = opened.remote;
+      await remote.startSession();
+
+      notice.setMessage("正在扫描本机文件…");
       const adapter: any = this.app.vault.adapter;
       const local = await buildManifest(adapter, {
         ignore: this.ignoreConfig(),
-        maxHashBytes: 24 * 1024 * 1024,
+        maxHashBytes: this.maxHashBytes(),
+        cache: this.localHashCache,
         onProgress: (info) => {
           if (info.scanned % 25 === 0) notice.setMessage(`扫描中 ${info.scanned}：${info.current}`);
         },
       });
+      // 清理本地缓存里已不存在的条目
+      const localPaths = new Set(local.entries.map((entry) => entry.path));
+      for (const p of Array.from(this.localHashCache.keys())) {
+        if (!localPaths.has(p)) this.localHashCache.delete(p);
+      }
 
-      notice.setMessage("正在获取电脑上的文件清单…");
-      const chunkBytes = Math.max(0.25, this.settings.chunkMB) * 1024 * 1024;
-      const remoteClient = new HttpRemote(target.base, target.token, chunkBytes);
-      remote = remoteClient;
-      await remoteClient.startSession();
-      const remoteManifest = await remoteClient.fetchManifest();
+      notice.setMessage(`正在获取远端（${opened.label}）文件清单…`);
+      const remoteManifest = await remote.fetchManifest();
       const baseline = await this.loadBaseline();
 
       // 清理基线里已经不在任何一端的条目（例如后来加入了新的忽略规则）
-      const knownPaths = new Set([
-        ...local.entries.map((entry) => entry.path),
-        ...remoteManifest.entries.map((entry) => entry.path),
-      ]);
+      const knownPaths = new Set([...localPaths, ...remoteManifest.entries.map((entry) => entry.path)]);
       for (const key of Object.keys(baseline.entries)) {
         if (!knownPaths.has(key)) delete baseline.entries[key];
       }
@@ -432,7 +539,7 @@ export default class LanSyncPlugin extends Plugin {
       notice.hide();
 
       this.log(
-        `同步预览（${this.settings.syncMode}）：本机 ${local.entries.length} / 电脑 ${remoteManifest.entries.length} → ${summarizePlan(plan)}`
+        `同步预览（${opened.label}/${this.settings.syncMode}）：本机 ${local.entries.length} / 远端 ${remoteManifest.entries.length} → ${summarizePlan(plan)}`
       );
 
       const hasWork = planHasWork(plan);
@@ -440,6 +547,7 @@ export default class LanSyncPlugin extends Plugin {
         .filter((item) => item.reason.includes("冲突标记"))
         .map((item) => item.path);
       if (!hasWork) {
+        await this.saveSyncCaches();
         this.updateStatusBar("ok");
         if (unsafePaths.length) {
           new Notice(
@@ -454,8 +562,12 @@ export default class LanSyncPlugin extends Plugin {
         return;
       }
 
-      // 首次同步 / 有冲突 / 触发删除熔断：必须用户确认，自动同步绝不擅自写入
-      const confirm = requiresConfirmation(plan, baseline);
+      // 首次同步 / 触发删除熔断必须确认；冲突在开启「自动留两份」时不再打断
+      let confirm = requiresConfirmation(plan, baseline);
+      if (confirm.required && plan.conflicts.length > 0 && this.settings.autoConflictResolve) {
+        const stillRequired = Boolean(plan.breaker) || baseline.updatedAt === 0;
+        if (!stillRequired) confirm = { required: false, reason: null };
+      }
       if (auto && confirm.required) {
         new Notice(`⏸ 已暂停自动同步：${confirm.reason}。请点侧栏 ⇅ 按钮预览并确认后执行。`, 12000);
         this.updateStatusBar("idle");
@@ -463,7 +575,9 @@ export default class LanSyncPlugin extends Plugin {
       }
 
       if (auto) {
-        const outcome = await this.applySync(plan, remoteClient, remoteManifest.entries, baseline);
+        const outcome = await this.applySync(plan, remote, remoteManifest.entries, baseline);
+        await this.finishConflicts(outcome, remote);
+        await this.saveSyncCaches();
         this.presentOutcome(outcome, true);
         return;
       }
@@ -475,7 +589,9 @@ export default class LanSyncPlugin extends Plugin {
         firstSync: baseline.updatedAt === 0,
         mode: this.settings.syncMode,
         onConfirm: async () => {
-          const outcome = await this.applySync(plan, remoteClient, remoteManifest.entries, baseline);
+          const outcome = await this.applySync(plan, remote!, remoteManifest.entries, baseline);
+          await this.finishConflicts(outcome, remote!);
+          await this.saveSyncCaches();
           this.presentOutcome(outcome, false);
         },
       }).open();
@@ -497,10 +613,54 @@ export default class LanSyncPlugin extends Plugin {
     }
   }
 
+  /** 自动处理冲突（默认「留两份、本机优先」）；关闭时留给 ConflictModal 人工复核。 */
+  private async finishConflicts(outcome: SyncOutcome, remote: SyncRemote): Promise<void> {
+    if (!outcome.conflictItems.length) return;
+    if (!this.settings.autoConflictResolve) return; // 交给弹窗
+    const r = await this.resolveConflictsAuto(outcome.conflictItems, remote);
+    outcome.resolvedConflicts = r.resolved;
+    if (r.errors.length) {
+      outcome.conflictErrors = r.errors;
+      for (const e of r.errors) outcome.lines.push(`  ✗ 冲突自动处理失败：${e}`);
+    }
+    if (r.resolved) outcome.lines.push("", `已自动保留两份（本机版留原名）：${r.resolved} 个`);
+    this.log(`自动处理冲突：成功 ${r.resolved}，失败 ${r.errors.length}`);
+    outcome.conflictItems = [];
+  }
+
+  private async resolveConflictsAuto(
+    conflicts: ConflictItem[],
+    remote: SyncRemote
+  ): Promise<{ resolved: number; errors: string[] }> {
+    const adapter: any = this.app.vault.adapter;
+    let baseline = await this.loadBaseline();
+    const errors: string[] = [];
+    let resolved = 0;
+    for (const conflict of conflicts) {
+      try {
+        const res = await applyKeepBothLocalWins(adapter, remote, remote, conflict, baseline, {
+          chunkBytes: this.chunkBytes(),
+          tmpDir: this.tempDir(),
+          makeCopyPath: conflictCopyPath,
+        });
+        if (res.errors.length) {
+          errors.push(`${conflict.path}：${res.errors.join("；")}`);
+        } else {
+          baseline = res.newBaseline;
+          resolved++;
+        }
+      } catch (err) {
+        errors.push(`${conflict.path}：${errMsg(err)}`);
+      }
+    }
+    await this.saveBaseline(baseline);
+    return { resolved, errors };
+  }
+
   /** 执行同步计划并返回结构化结果；不做任何提示，展示交给 presentOutcome。 */
   private async applySync(
     plan: SyncPlan,
-    remote: HttpRemote,
+    remote: SyncRemote,
     remoteEntries: FileEntry[],
     baseline: Baseline
   ): Promise<SyncOutcome> {
@@ -606,7 +766,7 @@ export default class LanSyncPlugin extends Plugin {
         for (const item of errors.slice(0, 20)) lines.push(`  ✗ ${item.path}：${item.message}`);
       }
       if (plan.conflicts.length) {
-        lines.push("", "冲突文件（两端都改过，本次保持原样）：");
+        lines.push("", "冲突文件（两端都改过）：");
         for (const item of plan.conflicts.slice(0, 20)) lines.push(`  ⚠ ${item.path}（${item.reason}）`);
       }
       if (selfUpdated) {
@@ -677,8 +837,10 @@ export default class LanSyncPlugin extends Plugin {
         .join("、")}${outcome.unsafeSkipped.length > 3 ? " 等" : ""}）`;
     }
     if (outcome.selfUpdated) text += "；插件文件已更新，需重启 Obsidian";
+    if (outcome.resolvedConflicts) text += `；已自动保留两份 ${outcome.resolvedConflicts} 个`;
+    if (outcome.conflictErrors?.length) text += `；${outcome.conflictErrors.length} 个冲突自动处理失败（见日志）`;
 
-    new Notice(text, outcome.errors.length || outcome.unsafeSkipped.length ? 12000 : 6000);
+    new Notice(text, outcome.errors.length || outcome.unsafeSkipped.length || outcome.conflictErrors?.length ? 12000 : 6000);
   }
 
   /** 错误提示统一入口：三处调用格式一致，且一定写入运行日志。 */
@@ -690,28 +852,29 @@ export default class LanSyncPlugin extends Plugin {
 
   /** 冲突的三个处理方式：留电脑 / 留手机 / 两份都留。 */
   async resolveConflict(conflict: ConflictItem, choice: "remote" | "local" | "both"): Promise<void> {
-    const target = this.resolveTarget();
-    const chunkBytes = Math.max(0.25, this.settings.chunkMB) * 1024 * 1024;
-    const remote = new HttpRemote(target.base, target.token, chunkBytes);
     const adapter: any = this.app.vault.adapter;
     this.applying = true;
+    let remote: SyncRemote | null = null;
     let sessionStarted = false;
     try {
+      const opened = await this.openRemote();
+      remote = opened.remote;
       await remote.startSession();
       sessionStarted = true;
       const baseline = await this.loadBaseline();
       const result = await applyConflictChoice(adapter, remote, remote, conflict, choice, baseline, {
-        chunkBytes,
+        chunkBytes: this.chunkBytes(),
         tmpDir: this.tempDir(),
         makeCopyPath: conflictCopyPath,
       });
       if (result.errors.length) throw new Error(result.errors.join("；"));
       await this.saveBaseline(result.newBaseline);
+      await this.saveSyncCaches();
       this.log(
         `解决冲突：${conflict.path} → ${choice}${result.copyPath ? `（副本 ${result.copyPath}）` : ""}`
       );
     } finally {
-      if (sessionStarted) await remote.endSession();
+      if (sessionStarted && remote) await remote.endSession();
       this.applying = false;
     }
   }
@@ -836,6 +999,8 @@ interface SyncOutcome {
   selfUpdated: boolean;
   breaker: string | null;
   lines: string[];
+  resolvedConflicts?: number;
+  conflictErrors?: string[];
 }
 
 interface SyncPreviewOptions {
@@ -878,7 +1043,7 @@ class SyncPreviewModal extends Modal {
     appendSection(lines, "将上传到电脑", plan.uploads.map((u) => `${u.path}（${formatBytes(u.size)}）`));
     appendSection(lines, "将删除本机", plan.deleteLocal);
     appendSection(lines, "将删除电脑上的文件", plan.deleteRemote);
-    appendSection(lines, "冲突（本次不处理）", plan.conflicts.map((c) => `${c.path}（${c.reason}）`));
+    appendSection(lines, "冲突（自动留两份 / 复核）", plan.conflicts.map((c) => `${c.path}（${c.reason}）`));
     appendSection(lines, "跳过", plan.skipped.map((s) => `${s.path}：${s.reason}`));
 
     const pre = contentEl.createEl("pre", { cls: "lan-sync-report" });
@@ -1000,6 +1165,10 @@ class ConflictModal extends Modal {
 
 function randomPairCode(): string {
   return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function randomDeviceId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 async function ensureParentDir(adapter: any, filePath: string): Promise<void> {

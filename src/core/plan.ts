@@ -53,6 +53,8 @@ export interface SyncPlan {
   deleteRemote: string[];
   conflicts: ConflictItem[];
   skipped: SkippedItem[];
+  /** 「一端删、另一端改」时按编辑优先重建被删侧的文件（不进冲突，自动解决） */
+  editWins?: string[];
   unchanged: number;
   unchangedPaths: string[];
   breaker: null | { message: string; deletes: number; total: number };
@@ -76,6 +78,7 @@ export function planSync(
     deleteRemote: [],
     conflicts: [],
     skipped: [],
+    editWins: [],
     unchanged: 0,
     unchangedPaths: [],
     breaker: null,
@@ -132,8 +135,14 @@ export function planSync(
 
     if (l && !r) {
       if (b) {
-        // 远端删除了这个文件 → 本机也应删除
-        plan.deleteLocal.push(path);
+        // 远端删除、本机还在：如果本机相对基线改过 → 编辑优先，重建远端（不静默丢改）
+        if (changedSinceBase(l, b)) {
+          plan.uploads.push(toItem(l));
+          plan.editWins!.push(path);
+        } else {
+          // 本机没动过 → 正常传播删除
+          plan.deleteLocal.push(path);
+        }
       } else {
         // 本机新增
         plan.uploads.push(toItem(l));
@@ -143,8 +152,14 @@ export function planSync(
 
     if (!l && r) {
       if (b) {
-        // 本机删除了这个文件 → 远端也应删除
-        plan.deleteRemote.push(path);
+        // 本机删除、远端还在：如果远端相对基线改过 → 编辑优先，恢复本机（不静默丢改）
+        if (changedSinceBase(r, b)) {
+          plan.downloads.push(toItem(r));
+          plan.editWins!.push(path);
+        } else {
+          // 远端没动过 → 正常传播删除
+          plan.deleteRemote.push(path);
+        }
       } else {
         // 远端新增
         plan.downloads.push(toItem(r));

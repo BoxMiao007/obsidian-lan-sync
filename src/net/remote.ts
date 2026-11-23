@@ -15,7 +15,38 @@ export interface RemoteChunkMeta {
   fileSha: string | null;
 }
 
-export class HttpRemote {
+/**
+ * 同步传输层的统一接口。
+ * - HttpRemote：电脑端 HTTP 服务（分块上传）
+ * - WebDavRemote：WebDAV 中转（整文件 PUT + MOVE）
+ * main 只需面向这个接口，具体用哪个由传输选择决定。
+ */
+export interface SyncRemote {
+  startSession(): Promise<void>;
+  endSession(): Promise<void>;
+  fetchManifest(timeoutMs?: number): Promise<Manifest>;
+  downloadFile(
+    path: string,
+    size: number,
+    onChunk: (meta: RemoteChunkMeta) => Promise<void> | void,
+    timeoutMs?: number
+  ): Promise<{ fileSha: string | null; bytes: number }>;
+  deleteRemote(path: string): Promise<void>;
+  backupFiles(paths: string[], folder: string): Promise<number>;
+  /** 整文件写入（WebDAV）；HttpRemote 不实现 */
+  putFile?(
+    path: string,
+    data: ArrayBuffer,
+    sha256: string | null,
+    mtime: number
+  ): Promise<{ size: number; sha256: string | null }>;
+  /** 分块写入（HTTP 服务）；WebDAV 不实现 */
+  initUpload?(path: string, size: number, sha256: string | null): Promise<string>;
+  uploadChunk?(uploadId: string, offset: number, chunk: ArrayBuffer): Promise<void>;
+  finishUpload?(uploadId: string): Promise<{ size: number; sha256: string | null }>;
+}
+
+export class HttpRemote implements SyncRemote {
   private sessionId: string | null = null;
 
   constructor(

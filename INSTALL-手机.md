@@ -93,4 +93,19 @@ http://192.168.x.x:28900/?token=123456
 `.git`、`.trash`、`workspace.json`、`workspace-mobile.json`、各插件的 `data.json`（含坚果云/GitHub 凭据）。
 
 本插件自己的目录只同步 `main.js` / `manifest.json` / `styles.css`（这样电脑更新插件后手机能自动跟上，拉取后需重启 Obsidian）；
-`data.json`（配对码）、`baseline.json`（同步基线）、`tmp/`（传输中间文件）永不同步。
+`data.json`（配对码/WebDAV 密码）、`baseline.json`（同步基线）、`sync-cache.json`（哈希缓存）、`tmp/`（传输中间文件）永不同步。
+
+## WebDAV 模式（v0.6 推荐，可不开电脑服务）
+
+前提：手机已用 rclone 起了 WebDAV（见 `/data/local/bin/webdav-start.sh`，默认 `0.0.0.0:8080`，共享 `/sdcard/aaa/webdav`）。
+
+手机端插件设置 →「WebDAV 中转」：
+
+- 启用 WebDAV 中转：开
+- 传输方式：自动
+- 手机 IP / 主机：**留空**（=127.0.0.1）
+- 端口：8080
+- 用户名 / 密码：填手机 rclone WebDAV 的账号密码（密码见设备私有文件 `/data/local/.webdav_pass`，只存在本机 data.json，不同步、不入库）
+- 同步根目录：留空即可（= `lansync/<库名>`；**电脑端必须填同一个值**）
+
+电脑端插件填同一套，只把「手机 IP / 主机」改成手机的局域网 IP。之后：点侧栏 ⇅ 即可；优先走 WebDAV，连不上手机时才退回直连电脑 HTTP 服务。

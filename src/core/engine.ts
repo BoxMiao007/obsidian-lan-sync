@@ -25,9 +25,17 @@ export interface FileDownloader {
 }
 
 export interface RemoteWriter {
-  initUpload(path: string, size: number, sha256: string | null): Promise<string>;
-  uploadChunk(uploadId: string, offset: number, chunk: ArrayBuffer): Promise<void>;
-  finishUpload(uploadId: string): Promise<{ size: number; sha256: string | null }>;
+  /** 整文件写入（WebDAV 用）：原子替换，返回落盘后的实际大小与内容哈希 */
+  putFile?(
+    path: string,
+    data: ArrayBuffer,
+    sha256: string | null,
+    mtime: number
+  ): Promise<{ size: number; sha256: string | null }>;
+  /** 分块写入（电脑端 HTTP 服务用） */
+  initUpload?(path: string, size: number, sha256: string | null): Promise<string>;
+  uploadChunk?(uploadId: string, offset: number, chunk: ArrayBuffer): Promise<void>;
+  finishUpload?(uploadId: string): Promise<{ size: number; sha256: string | null }>;
   deleteRemote(path: string): Promise<void>;
 }
 
@@ -201,20 +209,37 @@ export async function applyPushPlan(
         throw new Error("本地文件在扫描后发生变化，请重新同步");
       }
 
-      const uploadId = await remote.initUpload(item.path, item.size, sha);
-      for (let offset = 0; offset < item.size; offset += chunkBytes) {
-        const len = Math.min(chunkBytes, item.size - offset);
-        const chunk = buffer.slice(offset, offset + len);
-        await remote.uploadChunk(uploadId, offset, chunk);
-        options.onProgress?.({ done, total, label: `${item.path}@${offset}`, bytes });
-      }
-      const finished = await remote.finishUpload(uploadId);
-      if (finished.size !== item.size) {
-        throw new Error(`服务端大小不符：${finished.size}/${item.size}`);
-      }
-      if (sha && finished.sha256 && sha !== finished.sha256) {
-        throw new Error("服务端内容哈希不一致");
-      }
+      const uploadId = await (async () => {
+        if (typeof remote.putFile === "function") {
+          const finished = await remote.putFile(item.path, buffer, sha, item.mtime);
+          if (finished.size !== item.size) {
+            throw new Error(`远端大小不符：${finished.size}/${item.size}`);
+          }
+          if (sha && finished.sha256 && sha !== finished.sha256) {
+            throw new Error("远端内容哈希不一致");
+          }
+          return null;
+        }
+        if (remote.initUpload && remote.uploadChunk && remote.finishUpload) {
+          const id = await remote.initUpload(item.path, item.size, sha);
+          for (let offset = 0; offset < item.size; offset += chunkBytes) {
+            const len = Math.min(chunkBytes, item.size - offset);
+            const chunk = buffer.slice(offset, offset + len);
+            await remote.uploadChunk(id, offset, chunk);
+            options.onProgress?.({ done, total, label: `${item.path}@${offset}`, bytes });
+          }
+          const finished = await remote.finishUpload(id);
+          if (finished.size !== item.size) {
+            throw new Error(`服务端大小不符：${finished.size}/${item.size}`);
+          }
+          if (sha && finished.sha256 && sha !== finished.sha256) {
+            throw new Error("服务端内容哈希不一致");
+          }
+          return id;
+        }
+        throw new Error("远端不支持上传（既无 putFile 也无分块接口）");
+      })();
+      void uploadId;
       bytes += item.size;
       appliedUploads.push({ ...item, sha256: sha });
     } catch (err: any) {
@@ -318,6 +343,82 @@ export async function applyConflictChoice(
   });
   for (const item of result.errors) errors.push(item.message);
   return { newBaseline: result.newBaseline, errors };
+}
+
+/**
+ * 自动「留两份（本机优先）」：本机版保留原名，对端版另存为冲突副本，两份都同步回远端。
+ * 与 applyConflictChoice("both") 的区别：这里本机版占据原名，符合默认冲突策略。
+ */
+export async function applyKeepBothLocalWins(
+  adapter: EngineAdapter,
+  downloader: FileDownloader,
+  writer: RemoteWriter,
+  conflict: ConflictItem,
+  baseline: Baseline,
+  options: ConflictApplyOptions
+): Promise<{ newBaseline: Baseline; copyPath: string; errors: string[] }> {
+  const errors: string[] = [];
+  const copyPath = options.makeCopyPath(conflict.path);
+
+  // 1) 把对端版本下载到本地副本路径
+  try {
+    const tmp = `${options.tmpDir}/conflict-${Date.now()}.part`;
+    await ensureDir(adapter, dirname(tmp));
+    await ensureDir(adapter, dirname(copyPath));
+    let first = true;
+    let received = 0;
+    if (conflict.remoteSize === 0) {
+      await adapter.writeBinary(tmp, new ArrayBuffer(0));
+      first = false;
+    }
+    await downloader.downloadFile(conflict.path, conflict.remoteSize, async ({ chunk }) => {
+      if (first) {
+        await adapter.writeBinary(tmp, chunk);
+        first = false;
+      } else if (typeof adapter.appendBinary === "function") {
+        await adapter.appendBinary(tmp, chunk);
+      } else {
+        throw new Error("当前适配器不支持 appendBinary，无法分块写入");
+      }
+      received += chunk.byteLength;
+    });
+    if (received !== conflict.remoteSize) {
+      throw new Error(`下载对端版本大小不符：${received}/${conflict.remoteSize}`);
+    }
+    if (await adapter.exists(copyPath)) await adapter.remove(copyPath);
+    await adapter.rename(tmp, copyPath);
+  } catch (err: any) {
+    return {
+      newBaseline: baseline,
+      copyPath,
+      errors: [`备份对端版本失败：${(err && err.message) || err}`],
+    };
+  }
+
+  // 2) 把「本机原文件（原名）+ 对端副本」都推回远端
+  const localStat = await adapter.stat(conflict.path);
+  const copyStat = await adapter.stat(copyPath);
+  const uploads: ChangeItem[] = [
+    {
+      path: conflict.path,
+      size: conflict.localSize,
+      sha256: conflict.localSha,
+      mtime: localStat ? Math.trunc(localStat.mtime || 0) : 0,
+    },
+    {
+      path: copyPath,
+      size: conflict.remoteSize,
+      sha256: conflict.remoteSha,
+      mtime: copyStat ? Math.trunc(copyStat.mtime || 0) : 0,
+    },
+  ];
+  const result = await applyPushPlan(adapter, writer, conflictPlan({ uploads }), baseline, {
+    chunkBytes: options.chunkBytes,
+    remoteEntries: [],
+    onProgress: (info) => options.onProgress?.(`上传 ${info.label}`),
+  });
+  for (const item of result.errors) errors.push(`${item.path}：${item.message}`);
+  return { newBaseline: result.newBaseline, copyPath, errors };
 }
 
 function conflictToItem(conflict: ConflictItem, side: "remote" | "local"): ChangeItem {

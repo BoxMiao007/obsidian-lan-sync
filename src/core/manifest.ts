@@ -20,7 +20,22 @@ export interface ManifestOptions {
   maxHashBytes?: number;
   hasher?: (buffer: ArrayBuffer) => Promise<string | null>;
   onProgress?: (info: { scanned: number; hashed: number; current: string }) => void;
+  /**
+   * 本地哈希缓存：path → { size, mtime, sha256, unsafe }。
+   * 只用作「mtime+size 没变就复用上次哈希」的加速，不改变「哈希才是真相」的判定。
+   * 命中时跳过读文件；未命中才读取并重算，并回填缓存（原地修改）。
+   */
+  cache?: HashCache;
 }
+
+export interface HashCacheEntry {
+  size: number;
+  mtime: number;
+  sha256: string | null;
+  unsafe: boolean;
+}
+
+export type HashCache = Map<string, HashCacheEntry>;
 
 export async function buildManifest(
   adapter: ManifestAdapter,
@@ -48,29 +63,36 @@ export async function buildManifest(
 
   const entries: FileEntry[] = [];
   let hashed = 0;
+  const cache = options.cache;
   for (const path of files) {
     const stat = await adapter.stat(path);
     if (!stat || stat.type !== "file") continue;
     const size = stat.size;
+    const mtime = Math.trunc(stat.mtime || 0);
     let sha256: string | null = null;
     let unsafe = false;
-    if (size <= maxHashBytes) {
+    let determined = false;
+    const cached = cache?.get(path);
+    if (cached && cached.size === size && cached.mtime === mtime) {
+      sha256 = cached.sha256;
+      unsafe = cached.unsafe;
+      determined = true;
+    } else if (size <= maxHashBytes) {
       try {
         const buffer = await adapter.readBinary(path);
         sha256 = await hasher(buffer);
         unsafe = detectConflictMarkers(buffer);
         hashed++;
+        determined = true;
       } catch {
         sha256 = null;
       }
+    } else {
+      // 超大文件：不算哈希，按大小比较
+      determined = true;
     }
-    entries.push({
-      path,
-      size,
-      mtime: Math.trunc(stat.mtime || 0),
-      sha256,
-      unsafe,
-    });
+    if (cache && determined) cache.set(path, { size, mtime, sha256, unsafe });
+    entries.push({ path, size, mtime, sha256, unsafe });
     options.onProgress?.({ scanned: entries.length, hashed, current: path });
   }
 

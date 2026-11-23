@@ -35,6 +35,22 @@ export interface LanSyncSettings {
   firstSyncStrategy: "conflict" | "prefer-remote" | "prefer-local";
   /** 是否同步本插件的程序文件，让两端插件版本自动一致 */
   syncSelfCode: boolean;
+  /** 传输方式：auto=WebDAV 优先、手机端兜底电脑；webdav=只用 WebDAV；server=只用电脑直连 */
+  transport: "auto" | "webdav" | "server";
+  /** 是否启用 WebDAV 中转 */
+  webdavEnabled: boolean;
+  /** WebDAV 主机：手机留空（127.0.0.1），电脑填手机 IP */
+  webdavHost: string;
+  webdavPort: number;
+  webdavHttps: boolean;
+  webdavUser: string;
+  webdavPassword: string;
+  /** WebDAV 下用作同步根的子目录；留空 = lansync/<库名> */
+  webdavRoot: string;
+  /** 冲突自动「留两份、本机优先」；关闭则弹三选一复核 */
+  autoConflictResolve: boolean;
+  /** 设备唯一标识（锁文件里区分谁在同步） */
+  deviceId: string;
 }
 
 export const DEFAULT_SETTINGS: LanSyncSettings = {
@@ -54,6 +70,16 @@ export const DEFAULT_SETTINGS: LanSyncSettings = {
   syncPluginData: false,
   firstSyncStrategy: "conflict",
   syncSelfCode: true,
+  transport: "auto",
+  webdavEnabled: true,
+  webdavHost: "",
+  webdavPort: 8080,
+  webdavHttps: false,
+  webdavUser: "webdav",
+  webdavPassword: "",
+  webdavRoot: "",
+  autoConflictResolve: true,
+  deviceId: "",
 };
 
 export class LanSyncSettingTab extends PluginSettingTab {
@@ -73,12 +99,137 @@ export class LanSyncSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "局域网同步" });
     containerEl.createEl("p", {
       cls: "lan-sync-muted",
-      text: "同一 Wi-Fi 下，手机直接连电脑同步，不经过任何云服务。电脑端 Obsidian 需要保持运行。",
+      text: "优先通过手机上的 WebDAV 中转同步，连不上时再直连电脑 HTTP 服务。两端都装同一插件、填同一 WebDAV 凭据即可。",
     });
 
+    this.renderWebDavSection(containerEl);
     this.renderServerSection(containerEl);
     this.renderClientSection(containerEl);
     this.renderLogSection(containerEl);
+  }
+
+  private renderWebDavSection(parent: HTMLElement): void {
+    const card = parent.createDiv({ cls: "lan-sync-card" });
+    card.createEl("h3", { text: "WebDAV 中转（手机 rclone，推荐）" });
+    card.createEl("p", {
+      cls: "lan-sync-muted",
+      text: Platform.isMobileApp
+        ? "手机本身就是 WebDAV 宿主（127.0.0.1:8080），主机留空即可。同步写进 WebDAV 下的子目录，不碰 share 其它文件。"
+        : "电脑端填手机的局域网 IP（端口默认 8080），用户名/密码与手机 WebDAV 一致。优先走 WebDAV，连不上才退回电脑直连。",
+    });
+
+    const s = this.plugin.settings;
+
+    new Setting(card)
+      .setName("启用 WebDAV 中转")
+      .setDesc("关闭后只能用电脑端 HTTP 服务（旧模式）。")
+      .addToggle((t) =>
+        t.setValue(s.webdavEnabled).onChange(async (v) => {
+          s.webdavEnabled = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(card)
+      .setName("传输方式")
+      .setDesc("自动=WebDAV 优先、手机端兜底电脑直连；只用 WebDAV；只用电脑直连。")
+      .addDropdown((d) =>
+        d
+          .addOptions({ auto: "自动（推荐）", webdav: "只用 WebDAV", server: "只用电脑直连" })
+          .setValue(s.transport)
+          .onChange(async (v) => {
+            s.transport = v as "auto" | "webdav" | "server";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(card)
+      .setName("手机 IP / 主机")
+      .setDesc("只填 IP 或主机名，不要带 http:// 和端口。手机端可留空（=127.0.0.1）。")
+      .addText((text) =>
+        text
+          .setPlaceholder(Platform.isMobileApp ? "留空即 127.0.0.1" : "192.168.1.5")
+          .setValue(s.webdavHost)
+          .onChange(async (v) => {
+            s.webdavHost = v.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(card)
+      .setName("端口")
+      .setDesc("手机 rclone WebDAV 端口，默认 8080。")
+      .addText((text) =>
+        text
+          .setPlaceholder("8080")
+          .setValue(String(s.webdavPort))
+          .onChange(async (v) => {
+            const n = parseInt(v, 10);
+            if (Number.isFinite(n) && n >= 1 && n <= 65535) {
+              s.webdavPort = n;
+              await this.plugin.saveSettings();
+            }
+          })
+      );
+
+    new Setting(card)
+      .setName("使用 HTTPS")
+      .setDesc("rclone 默认明文 HTTP（仅限可信 LAN）。加了 TLS 才打开。")
+      .addToggle((t) =>
+        t.setValue(s.webdavHttps).onChange(async (v) => {
+          s.webdavHttps = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(card)
+      .setName("用户名")
+      .addText((text) =>
+        text
+          .setPlaceholder("webdav")
+          .setValue(s.webdavUser)
+          .onChange(async (v) => {
+            s.webdavUser = v.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(card)
+      .setName("密码")
+      .setDesc("存本机 data.json（该文件不参与同步）。")
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text
+          .setPlaceholder("device 私有")
+          .setValue(s.webdavPassword)
+          .onChange(async (v) => {
+            s.webdavPassword = v;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(card)
+      .setName("同步根目录")
+      .setDesc("WebDAV 下的子目录，留空 = lansync/<库名>。用于隔离，避免误删 share 其它文件。")
+      .addText((text) =>
+        text
+          .setPlaceholder("lansync/我的库")
+          .setValue(s.webdavRoot)
+          .onChange(async (v) => {
+            s.webdavRoot = v.trim();
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(card)
+      .setName("冲突自动留两份（本机优先）")
+      .setDesc("两端都改的文件自动保留两份、本机版留原名，不打断同步。关闭则弹「留电脑/留手机/两份都留」复核。")
+      .addToggle((t) =>
+        t.setValue(s.autoConflictResolve).onChange(async (v) => {
+          s.autoConflictResolve = v;
+          await this.plugin.saveSettings();
+        })
+      );
   }
 
   private renderServerSection(parent: HTMLElement): void {

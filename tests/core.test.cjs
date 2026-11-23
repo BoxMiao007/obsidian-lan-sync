@@ -388,3 +388,25 @@ test("计划：含冲突标记的文件一律跳过，不做任何动作", () =>
   assert.equal(plan2.downloads.length + plan2.uploads.length, 0);
   assert.ok(plan2.skipped.some((s) => s.path === "b.md"));
 });
+
+test("manifest：本地哈希缓存命中后不再读文件", async () => {
+  const baseAdapter = makeMemoryAdapter({ "a.md": "hello", "b.md": "world" });
+  let reads = 0;
+  const adapter = {
+    ...baseAdapter,
+    readBinary: async (p) => {
+      reads++;
+      return baseAdapter.readBinary(p);
+    },
+  };
+  const cache = new Map();
+  const m1 = await buildManifest(adapter, { ignore: IGNORE, cache });
+  assert.equal(reads, 2, "首次应读两个文件算哈希");
+  assert.equal(m1.entries.length, 2);
+
+  reads = 0;
+  const m2 = await buildManifest(adapter, { ignore: IGNORE, cache });
+  assert.equal(reads, 0, "第二次（mtime/size 未变）应命中缓存，不再读文件");
+  assert.equal(m2.entries.length, 2);
+  assert.equal(m2.entries.find((e) => e.path === "a.md").sha256, m1.entries.find((e) => e.path === "a.md").sha256);
+});
