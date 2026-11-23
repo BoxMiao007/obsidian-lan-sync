@@ -82,6 +82,12 @@ export const DEFAULT_SETTINGS: LanSyncSettings = {
   deviceId: "",
 };
 
+type ButtonDef = { text: string; cta?: boolean; onClick: () => void | Promise<void> };
+
+/**
+ * 设置页。用一组小的构建器（toggle/text/number/dropdown/buttons）收敛样板，
+ * 再按语义拆成独立卡片；所有设置项与持久化行为保持不变。
+ */
 export class LanSyncSettingTab extends PluginSettingTab {
   plugin: LanSyncPlugin;
   private logEl: HTMLElement | null = null;
@@ -95,517 +101,375 @@ export class LanSyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass("lan-sync-settings");
-
     containerEl.createEl("h2", { text: "局域网同步" });
-    containerEl.createEl("p", {
-      cls: "lan-sync-muted",
-      text: "优先通过手机上的 WebDAV 中转同步，连不上时再直连电脑 HTTP 服务。两端都装同一插件、填同一 WebDAV 凭据即可。",
-    });
 
     this.renderWebDavSection(containerEl);
+    this.renderSyncSection(containerEl);
+    this.renderAutoSyncSection(containerEl);
     this.renderServerSection(containerEl);
-    this.renderClientSection(containerEl);
+    this.renderSelfTestSection(containerEl);
     this.renderLogSection(containerEl);
   }
 
-  private renderWebDavSection(parent: HTMLElement): void {
+  // ---------- 卡片与构件的公共封装 ----------
+
+  private card(parent: HTMLElement, title: string, intro?: string): HTMLElement {
     const card = parent.createDiv({ cls: "lan-sync-card" });
-    card.createEl("h3", { text: "WebDAV 中转（手机 rclone，推荐）" });
-    card.createEl("p", {
-      cls: "lan-sync-muted",
-      text: "WebDAV 服务器通常是单独一台常开设备（如旧手机上的 rclone，默认 :8080）。主用手机与电脑这两个 Obsidian 都填写它的 IP；连不上时才由手机端兜底直连电脑。",
-    });
-
-    const s = this.plugin.settings;
-
-    new Setting(card)
-      .setName("启用 WebDAV 中转")
-      .setDesc("关闭后只能用电脑端 HTTP 服务（旧模式）。")
-      .addToggle((t) =>
-        t.setValue(s.webdavEnabled).onChange(async (v) => {
-          s.webdavEnabled = v;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(card)
-      .setName("传输方式")
-      .setDesc("自动=WebDAV 优先、手机端兜底电脑直连；只用 WebDAV；只用电脑直连。")
-      .addDropdown((d) =>
-        d
-          .addOptions({ auto: "自动（推荐）", webdav: "只用 WebDAV", server: "只用电脑直连" })
-          .setValue(s.transport)
-          .onChange(async (v) => {
-            s.transport = v as "auto" | "webdav" | "server";
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(card)
-      .setName("WebDAV 服务器 IP / 主机")
-      .setDesc("填运行 rclone WebDAV 的那台设备（如旧手机）的局域网 IP，只填 IP 或主机名，不带 http:// 和端口。")
-      .addText((text) =>
-        text
-          .setPlaceholder("192.168.1.5")
-          .setValue(s.webdavHost)
-          .onChange(async (v) => {
-            s.webdavHost = v.trim();
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(card)
-      .setName("端口")
-      .setDesc("手机 rclone WebDAV 端口，默认 8080。")
-      .addText((text) =>
-        text
-          .setPlaceholder("8080")
-          .setValue(String(s.webdavPort))
-          .onChange(async (v) => {
-            const n = parseInt(v, 10);
-            if (Number.isFinite(n) && n >= 1 && n <= 65535) {
-              s.webdavPort = n;
-              await this.plugin.saveSettings();
-            }
-          })
-      );
-
-    new Setting(card)
-      .setName("使用 HTTPS")
-      .setDesc("rclone 默认明文 HTTP（仅限可信 LAN）。加了 TLS 才打开。")
-      .addToggle((t) =>
-        t.setValue(s.webdavHttps).onChange(async (v) => {
-          s.webdavHttps = v;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(card)
-      .setName("用户名")
-      .addText((text) =>
-        text
-          .setPlaceholder("webdav")
-          .setValue(s.webdavUser)
-          .onChange(async (v) => {
-            s.webdavUser = v.trim();
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(card)
-      .setName("密码")
-      .setDesc("存本机 data.<设备>.json（该文件不参与同步）。")
-      .addText((text) => {
-        text.inputEl.type = "password";
-        text
-          .setPlaceholder("device 私有")
-          .setValue(s.webdavPassword)
-          .onChange(async (v) => {
-            s.webdavPassword = v;
-            await this.plugin.saveSettings();
-          });
-      });
-
-    const rootPreview = card.createEl("div", {
-      cls: "lan-sync-url",
-      text: `当前同步根：${this.plugin.webdavRoot()}`,
-    });
-    new Setting(card)
-      .setName("路径前缀（可选）")
-      .setDesc("可自定义命名/层级（如 aaa/play），留空则直接用库名。库名固定为当前库文件夹名，不可修改。")
-      .addText((text) =>
-        text
-          .setPlaceholder("留空 = 直接用库名")
-          .setValue(s.webdavPathPrefix)
-          .onChange(async (v) => {
-            s.webdavPathPrefix = v;
-            await this.plugin.saveSettings();
-            rootPreview.setText(`当前同步根：${this.plugin.webdavRoot()}`);
-          })
-      );
-
-    new Setting(card)
-      .setName("冲突自动留两份（本机优先）")
-      .setDesc("两端都改的文件自动保留两份、本机版留原名，不打断同步。关闭则弹「留电脑/留手机/两份都留」复核。")
-      .addToggle((t) =>
-        t.setValue(s.autoConflictResolve).onChange(async (v) => {
-          s.autoConflictResolve = v;
-          await this.plugin.saveSettings();
-        })
-      );
+    card.createEl("h3", { text: title });
+    if (intro) card.createEl("p", { cls: "lan-sync-muted", text: intro });
+    return card;
   }
 
+  private base(parent: HTMLElement, name: string, desc?: string): Setting {
+    const st = new Setting(parent).setName(name);
+    if (desc) st.setDesc(desc);
+    return st;
+  }
+
+  private async commit(): Promise<void> {
+    await this.plugin.saveSettings();
+  }
+
+  private toggle(parent: HTMLElement, name: string, value: boolean, onSet: (v: boolean) => void, desc?: string): void {
+    this.base(parent, name, desc).addToggle((t) =>
+      t.setValue(value).onChange(async (v) => {
+        onSet(v);
+        await this.commit();
+      })
+    );
+  }
+
+  private text(
+    parent: HTMLElement,
+    name: string,
+    value: string,
+    onInput: (v: string) => void,
+    opts: { desc?: string; placeholder?: string; password?: boolean } = {}
+  ): void {
+    this.base(parent, name, opts.desc).addText((t) => {
+      if (opts.password) t.inputEl.type = "password";
+      t.setPlaceholder(opts.placeholder ?? "")
+        .setValue(value)
+        .onChange(async (v) => {
+          onInput(v);
+          await this.commit();
+        });
+    });
+  }
+
+  private number(
+    parent: HTMLElement,
+    name: string,
+    value: number,
+    onValid: (v: number) => void,
+    opts: { desc?: string; placeholder?: string; min: number; max: number; integer?: boolean }
+  ): void {
+    const integer = opts.integer !== false;
+    this.base(parent, name, opts.desc).addText((t) =>
+      t.setPlaceholder(opts.placeholder ?? String(value))
+        .setValue(String(value))
+        .onChange(async (v) => {
+          const n = integer ? parseInt(v, 10) : parseFloat(v);
+          if (Number.isFinite(n) && n >= opts.min && n <= opts.max) {
+            onValid(n);
+            await this.commit();
+          }
+        })
+    );
+  }
+
+  private dropdown(
+    parent: HTMLElement,
+    name: string,
+    value: string,
+    options: Record<string, string>,
+    onSet: (v: string) => void,
+    desc?: string
+  ): void {
+    this.base(parent, name, desc).addDropdown((d) =>
+      d.addOptions(options).setValue(value).onChange(async (v) => {
+        onSet(v);
+        await this.commit();
+      })
+    );
+  }
+
+  private buttons(parent: HTMLElement, name: string, defs: ButtonDef[], desc?: string): void {
+    const st = this.base(parent, name, desc);
+    for (const b of defs) {
+      st.addButton((btn) => {
+        btn.setButtonText(b.text);
+        if (b.cta) btn.setCta();
+        btn.onClick(async () => {
+          await b.onClick();
+        });
+      });
+    }
+  }
+
+  // ---------- WebDAV 中转 ----------
+
+  private renderWebDavSection(parent: HTMLElement): void {
+    const s = this.plugin.settings;
+    const card = this.card(
+      parent,
+      "WebDAV 中转（推荐）",
+      "主用手机与电脑都连这台 WebDAV（如旧手机上的 rclone，默认 :8080）；手机连不上时才兜底直连电脑。"
+    );
+
+    this.toggle(card, "启用 WebDAV 中转", s.webdavEnabled, (v) => (s.webdavEnabled = v), "关闭后只能用电脑端 HTTP 服务（旧模式）。");
+
+    this.dropdown(
+      card,
+      "传输方式",
+      s.transport,
+      { auto: "自动（推荐）", webdav: "只用 WebDAV", server: "只用电脑直连" },
+      (v) => (s.transport = v as LanSyncSettings["transport"]),
+      "自动 = WebDAV 优先、手机端兜底电脑直连。"
+    );
+
+    this.text(card, "WebDAV 服务器 IP / 主机", s.webdavHost, (v) => (s.webdavHost = v.trim()), {
+      desc: "运行 rclone WebDAV 的那台设备的局域网 IP，只填 IP/主机名，不带 http:// 和端口。",
+      placeholder: "192.168.1.5",
+    });
+
+    this.number(card, "端口", s.webdavPort, (v) => (s.webdavPort = v), { desc: "rclone WebDAV 端口，默认 8080。", min: 1, max: 65535 });
+
+    this.toggle(card, "使用 HTTPS", s.webdavHttps, (v) => (s.webdavHttps = v), "rclone 默认明文 HTTP（仅限可信 LAN），加 TLS 才打开。");
+
+    this.text(card, "用户名", s.webdavUser, (v) => (s.webdavUser = v.trim()), { placeholder: "webdav" });
+
+    this.text(card, "密码", s.webdavPassword, (v) => (s.webdavPassword = v), { desc: "存本机 data.<设备>.json（该文件不参与同步）。", placeholder: "device 私有", password: true });
+
+    const rootPreview = card.createEl("div", { cls: "lan-sync-url", text: `当前同步根：${this.plugin.webdavRoot()}` });
+    this.text(card, "路径前缀（可选）", s.webdavPathPrefix, (v) => {
+      s.webdavPathPrefix = v;
+      rootPreview.setText(`当前同步根：${this.plugin.webdavRoot()}`);
+    }, {
+      desc: "可自定义命名/层级（如 aaa/play），留空则直接用库名。库名固定为当前库文件夹名，不可修改。",
+      placeholder: "留空 = 直接用库名",
+    });
+  }
+
+  // ---------- 同步行为 ----------
+
+  private renderSyncSection(parent: HTMLElement): void {
+    const s = this.plugin.settings;
+    const card = this.card(parent, "同步行为");
+
+    this.dropdown(
+      card,
+      "同步方向",
+      s.syncMode,
+      { pull: "只拉取（电脑 → 本机）", push: "只推送（本机 → 电脑）", both: "双向" },
+      (v) => (s.syncMode = v as LanSyncSettings["syncMode"]),
+      "pull=只拉取；push=只推送；both=双向（推荐最终使用）。"
+    );
+
+    this.buttons(card, "立即同步", [{ text: "立即同步", cta: true, onClick: () => this.plugin.runSync() }], "先预览差异，确认后才写入。");
+
+    this.toggle(
+      card,
+      "冲突自动留两份（本机优先）",
+      s.autoConflictResolve,
+      (v) => (s.autoConflictResolve = v),
+      "两端都改的文件自动保留两份、本机版留原名，不打断同步；关闭则弹「留电脑/留手机/两份都留」复核。"
+    );
+
+    this.dropdown(
+      card,
+      "首次同步冲突处理",
+      s.firstSyncStrategy,
+      { conflict: "逐条询问（最安全）", "prefer-remote": "以电脑为准（覆盖本机同名文件）", "prefer-local": "以本机为准（覆盖电脑同名文件）" },
+      (v) => (s.firstSyncStrategy = v as LanSyncSettings["firstSyncStrategy"]),
+      "本机已有旧副本时，两边同名但内容不同的处理方式。"
+    );
+
+    this.number(card, "分块大小（MB）", s.chunkMB, (v) => (s.chunkMB = v), {
+      desc: "默认 4MB；手机自检 8MB 失败就调到 1–2MB。",
+      min: 0.25,
+      max: 16,
+      integer: false,
+    });
+
+    this.number(card, "删除保护阈值", s.maxDeletes, (v) => (s.maxDeletes = v), {
+      desc: "一次同步要删除超过这么多文件就中止，防止误删/换机清空。",
+      min: 1,
+      max: 1000,
+    });
+
+    this.toggle(
+      card,
+      "同步本插件程序文件",
+      s.syncSelfCode,
+      (v) => (s.syncSelfCode = v),
+      "把 main.js / manifest.json / styles.css 一起同步，电脑更新后手机自动跟上（拉取后需重启 Obsidian）。data.<设备>.json、基线、缓存、临时文件永不同步。"
+    );
+
+    this.toggle(
+      card,
+      "同步第三方插件设置（危险）",
+      s.syncPluginData,
+      (v) => (s.syncPluginData = v),
+      "开启后会把各插件的 data.json 一并同步，其中可能含坚果云、GitHub 等密码/令牌，局域网明文传输有泄露风险。"
+    );
+  }
+
+  // ---------- 自动同步 ----------
+
+  private renderAutoSyncSection(parent: HTMLElement): void {
+    const s = this.plugin.settings;
+    const card = this.card(parent, "自动同步");
+
+    this.toggle(card, "自动同步总开关", s.syncEnabled, (v) => (s.syncEnabled = v), "关闭后只有手动点「立即同步」才会同步。");
+    this.toggle(card, "打开 app 时自动同步", s.syncOnOpen, (v) => (s.syncOnOpen = v), "手机端每次打开 Obsidian 后自动拉一次（首次同步仍会先确认）。");
+
+    this.number(card, "文件变更后自动同步（秒）", s.syncDebounceSeconds, (v) => (s.syncDebounceSeconds = v), {
+      desc: "编辑停止多少秒后自动同步；0 = 关闭。手机端仅在 Obsidian 前台时有效。",
+      min: 0,
+      max: 600,
+    });
+
+    this.number(card, "定时同步（分钟）", s.syncIntervalMinutes, (v) => (s.syncIntervalMinutes = v), {
+      desc: "每隔多少分钟同步一次；0 = 关闭。",
+      min: 0,
+      max: 1440,
+    });
+  }
+
+  // ---------- 电脑端 · 服务端 ----------
+
   private renderServerSection(parent: HTMLElement): void {
-    const card = parent.createDiv({ cls: "lan-sync-card" });
-    card.createEl("h3", { text: "电脑端 · 服务端" });
+    const card = this.card(parent, "电脑端 · 服务端");
 
     if (!Platform.isDesktopApp) {
       card.createEl("p", {
         cls: "lan-sync-muted",
-        text: "手机端没有 Node 运行环境，无法监听端口。服务端只在电脑上运行，手机作为客户端连接。",
+        text: "手机端没有 Node 运行环境，无法监听端口；服务端只在电脑上运行，手机作为客户端连接。",
       });
       return;
     }
 
+    const s = this.plugin.settings;
     const running = Boolean(this.plugin.server);
-    card.createEl("p", {
-      cls: running ? "lan-sync-ok" : "lan-sync-warn",
-      text: running
-        ? `运行中 · 端口 ${this.plugin.server?.port}`
-        : "未启动（点下方按钮启动）",
-    });
+    card.createEl("p", { cls: running ? "lan-sync-ok" : "lan-sync-warn", text: running ? `运行中 · 端口 ${this.plugin.server?.port}` : "未启动（点下方按钮启动）" });
 
     if (running && this.plugin.server) {
       for (const addr of this.plugin.server.addresses) {
         card.createEl("div", { cls: "lan-sync-url", text: `${addr.url}    （${addr.name}）` });
       }
       const lanUrl = this.plugin.server.addresses[0]?.url || this.plugin.server.urls[0];
-      card.createEl("p", {
-        cls: "lan-sync-muted",
-        text: "手机浏览器打开下面这个地址，可以直接下载插件文件并验证网络：",
-      });
-      card.createEl("div", {
-        cls: "lan-sync-url",
-        text: `${lanUrl}/?token=${this.plugin.settings.token}`,
-      });
-      card.createEl("p", {
-        cls: "lan-sync-muted",
-        text: `把上面的 IP / 端口 / 配对码填到手机端的插件设置里。带 VMware/VirtualBox 字样的网卡不用管。`,
-      });
+      card.createEl("div", { cls: "lan-sync-url", text: `${lanUrl}/?token=${s.token}` });
+      card.createEl("p", { cls: "lan-sync-muted", text: "手机浏览器打开上面地址可直接下载插件并验证网络；把该 IP / 端口 / 配对码填到手机端设置里。带 VMware/VirtualBox 字样的网卡不用管。" });
     }
 
-    new Setting(card)
-      .setName("Obsidian 启动时自动开服务")
-      .setDesc("关闭后需要手动点「启动服务」。")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.autoStartServer).onChange(async (value) => {
-          this.plugin.settings.autoStartServer = value;
-          await this.plugin.saveSettings();
-        })
-      );
+    this.toggle(card, "Obsidian 启动时自动开服务", s.autoStartServer, (v) => (s.autoStartServer = v), "关闭后需手动点「启动服务」。");
 
-    new Setting(card)
-      .setName("监听端口")
-      .setDesc("默认 28900；被占用时会自动顺延到下一个可用端口。")
-      .addText((text) =>
-        text
-          .setPlaceholder("28900")
-          .setValue(String(this.plugin.settings.port))
-          .onChange(async (value) => {
-            const parsed = parseInt(value, 10);
-            if (Number.isFinite(parsed) && parsed >= 1024 && parsed <= 65535) {
-              this.plugin.settings.port = parsed;
-              this.plugin.settings.clientPort = parsed;
-              await this.plugin.saveSettings();
+    this.number(card, "监听端口", s.port, (v) => {
+      s.port = v;
+      s.clientPort = v;
+    }, { desc: "默认 28900；被占用会自动顺延到下一个可用端口。", min: 1024, max: 65535 });
+
+    this.text(card, "配对码", s.token, (v) => {
+      const clean = v.replace(/\D/g, "").slice(0, 8);
+      s.token = clean;
+      s.clientToken = clean;
+    }, { desc: "6 位数字，手机端必须填一致；请求带签名，改完需重启服务。", placeholder: "6 位数字" });
+
+    this.buttons(
+      card,
+      "服务控制",
+      [
+        {
+          text: running ? "停止服务" : "启动服务",
+          onClick: async () => {
+            try {
+              if (this.plugin.server) await this.plugin.stopServer();
+              else await this.plugin.startServer();
+            } catch (err) {
+              new Notice(`操作失败：${errMsg(err)}`);
             }
-          })
-      );
-
-    new Setting(card)
-      .setName("配对码")
-      .setDesc("6 位数字，手机端必须填一致；请求带签名，改完需要重启服务。")
-      .addText((text) =>
-        text
-          .setPlaceholder("6 位数字")
-          .setValue(this.plugin.settings.token)
-          .onChange(async (value) => {
-            const clean = value.replace(/\D/g, "").slice(0, 8);
-            this.plugin.settings.token = clean;
-            this.plugin.settings.clientToken = clean;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(card)
-      .setName("服务控制")
-      .addButton((btn) =>
-        btn.setButtonText(running ? "停止服务" : "启动服务").onClick(async () => {
-          try {
-            if (this.plugin.server) await this.plugin.stopServer();
-            else await this.plugin.startServer();
-          } catch (err) {
-            new Notice(`操作失败：${errMsg(err)}`);
-          }
-          this.display();
-        })
-      )
-      .addButton((btn) =>
-        btn.setButtonText("重启服务").onClick(async () => {
-          try {
-            await this.plugin.restartServer();
-          } catch (err) {
-            new Notice(`重启失败：${errMsg(err)}`);
-          }
-          this.display();
-        })
-      )
-      .addButton((btn) =>
-        btn.setButtonText("复制地址").onClick(async () => {
-          const url = this.plugin.server?.urls[0];
-          if (!url) {
-            new Notice("服务未启动");
-            return;
-          }
-          await navigator.clipboard.writeText(url).catch(() => undefined);
-          new Notice("已复制");
-        })
-      );
+            this.display();
+          },
+        },
+        {
+          text: "重启服务",
+          onClick: async () => {
+            try {
+              await this.plugin.restartServer();
+            } catch (err) {
+              new Notice(`重启失败：${errMsg(err)}`);
+            }
+            this.display();
+          },
+        },
+        {
+          text: "复制地址",
+          onClick: async () => {
+            const url = this.plugin.server?.urls[0];
+            if (!url) {
+              new Notice("服务未启动");
+              return;
+            }
+            await navigator.clipboard.writeText(url).catch(() => undefined);
+            new Notice("已复制");
+          },
+        },
+      ]
+    );
   }
 
-  private renderClientSection(parent: HTMLElement): void {
-    const card = parent.createDiv({ cls: "lan-sync-card" });
-    card.createEl("h3", { text: "客户端 · 网络自检" });
-    card.createEl("p", {
-      cls: "lan-sync-muted",
-      text: Platform.isDesktopApp
-        ? "电脑上可以留空地址，直接测本机服务；也可以填局域网 IP 测真实链路。"
-        : "填写电脑上显示的 192.168.x.x 地址和配对码，然后点「完整自检」。",
-    });
+  // ---------- 客户端 · 网络自检 ----------
 
-    new Setting(card)
-      .setName("电脑 IP")
-      .setDesc("只填 IP 或主机名，不要带 http:// 和端口。")
-      .addText((text) =>
-        text
-          .setPlaceholder("192.168.1.5")
-          .setValue(this.plugin.settings.clientHost)
-          .onChange(async (value) => {
-            this.plugin.settings.clientHost = value.trim();
-            await this.plugin.saveSettings();
-          })
-      );
+  private renderSelfTestSection(parent: HTMLElement): void {
+    const s = this.plugin.settings;
+    const card = this.card(
+      parent,
+      "网络自检（电脑直连兜底）",
+      Platform.isDesktopApp ? "电脑端可留空地址直接测本机；也可填局域网 IP 测真实链路。" : "填电脑上显示的 192.168.x.x 地址和配对码，再点「完整自检」。"
+    );
 
-    new Setting(card)
-      .setName("端口")
-      .addText((text) =>
-        text
-          .setPlaceholder("28900")
-          .setValue(String(this.plugin.settings.clientPort))
-          .onChange(async (value) => {
-            const parsed = parseInt(value, 10);
-            if (Number.isFinite(parsed) && parsed >= 1024 && parsed <= 65535) {
-              this.plugin.settings.clientPort = parsed;
-              await this.plugin.saveSettings();
-            }
-          })
-      );
+    this.text(card, "电脑 IP", s.clientHost, (v) => (s.clientHost = v.trim()), { desc: "只填 IP 或主机名，不带 http:// 和端口。", placeholder: "192.168.1.5" });
 
-    new Setting(card)
-      .setName("配对码")
-      .addText((text) =>
-        text
-          .setPlaceholder("6 位数字")
-          .setValue(this.plugin.settings.clientToken)
-          .onChange(async (value) => {
-            this.plugin.settings.clientToken = value.replace(/\D/g, "").slice(0, 8);
-            await this.plugin.saveSettings();
-          })
-      );
+    this.number(card, "端口", s.clientPort, (v) => (s.clientPort = v), { placeholder: "28900", min: 1024, max: 65535 });
 
-    new Setting(card)
-      .setName("开始测试")
-      .setDesc("「完整自检」会依次测：requestUrl、fetch、1MB/8MB 分块下载、写盘、2MB 上传。")
-      .addButton((btn) =>
-        btn
-          .setButtonText("仅测连通")
-          .onClick(async () => {
+    this.text(card, "配对码", s.clientToken, (v) => (s.clientToken = v.replace(/\D/g, "").slice(0, 8)), { placeholder: "6 位数字" });
+
+    this.buttons(
+      card,
+      "开始测试",
+      [
+        {
+          text: "仅测连通",
+          onClick: async () => {
             try {
               const target = this.plugin.resolveTarget();
               const a = await pingWithRequestUrl(target);
               const b = await pingWithFetch(target);
-              new Notice(
-                `${a.ok ? "✓" : "✗"} requestUrl（${a.ms}ms）\n${b.ok ? "✓" : "✗"} fetch（${b.ms}ms）`,
-                8000
-              );
+              new Notice(`${a.ok ? "✓" : "✗"} requestUrl（${a.ms}ms）\n${b.ok ? "✓" : "✗"} fetch（${b.ms}ms）`, 8000);
               this.plugin.log(`连通测试：requestUrl=${a.ok} fetch=${b.ok}`);
             } catch (err) {
               new Notice(errMsg(err));
             }
-          })
-      )
-      .addButton((btn) =>
-        btn
-          .setButtonText("完整自检")
-          .setCta()
-          .onClick(async () => {
-            await this.plugin.runSelfTest();
-          })
-      );
-
-    new Setting(card)
-      .setName("同步方向")
-      .setDesc("pull = 只把电脑改动拉到本机；push = 只把本机改动推到电脑；both = 双向（推荐最终使用）")
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOptions({
-            pull: "只拉取（电脑 → 本机）",
-            push: "只推送（本机 → 电脑）",
-            both: "双向",
-          })
-          .setValue(this.plugin.settings.syncMode)
-          .onChange(async (value) => {
-            this.plugin.settings.syncMode = value as "pull" | "push" | "both";
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(card)
-      .setName("同步")
-      .setDesc("先预览差异，确认后才写入。")
-      .addButton((btn) =>
-        btn
-          .setButtonText("立即同步")
-          .setCta()
-          .onClick(async () => {
-            await this.plugin.runSync();
-          })
-      );
-
-    new Setting(card)
-      .setName("分块大小")
-      .setDesc("默认 4MB。手机自检如果 8MB 失败，调成 1–2MB。")
-      .addText((text) =>
-        text
-          .setPlaceholder("4")
-          .setValue(String(this.plugin.settings.chunkMB))
-          .onChange(async (value) => {
-            const parsed = parseFloat(value);
-            if (Number.isFinite(parsed) && parsed >= 0.25 && parsed <= 16) {
-              this.plugin.settings.chunkMB = parsed;
-              await this.plugin.saveSettings();
-            }
-          })
-      );
-
-    new Setting(card)
-      .setName("删除保护阈值")
-      .setDesc("一次同步要删除超过这么多文件就中止，防止误删/换机清空。")
-      .addText((text) =>
-        text
-          .setPlaceholder("20")
-          .setValue(String(this.plugin.settings.maxDeletes))
-          .onChange(async (value) => {
-            const parsed = parseInt(value, 10);
-            if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 1000) {
-              this.plugin.settings.maxDeletes = parsed;
-              await this.plugin.saveSettings();
-            }
-          })
-      );
-
-    new Setting(card)
-      .setName("自动同步总开关")
-      .setDesc("关闭后只有手动点「立即同步」才会同步。")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.syncEnabled).onChange(async (value) => {
-          this.plugin.settings.syncEnabled = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(card)
-      .setName("打开 app 时自动同步")
-      .setDesc("手机端每次打开 Obsidian 后自动拉一次（首次同步仍会先让你确认）。")
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.syncOnOpen).onChange(async (value) => {
-          this.plugin.settings.syncOnOpen = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(card)
-      .setName("文件变更后自动同步")
-      .setDesc("编辑停止多少秒后自动同步；0 = 关闭。手机端仅在 Obsidian 处于前台时有效。")
-      .addText((text) =>
-        text
-          .setPlaceholder("10")
-          .setValue(String(this.plugin.settings.syncDebounceSeconds))
-          .onChange(async (value) => {
-            const parsed = parseInt(value, 10);
-            if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 600) {
-              this.plugin.settings.syncDebounceSeconds = parsed;
-              await this.plugin.saveSettings();
-            }
-          })
-      );
-
-    new Setting(card)
-      .setName("定时同步")
-      .setDesc("每隔多少分钟同步一次；0 = 关闭。")
-      .addText((text) =>
-        text
-          .setPlaceholder("0")
-          .setValue(String(this.plugin.settings.syncIntervalMinutes))
-          .onChange(async (value) => {
-            const parsed = parseInt(value, 10);
-            if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 1440) {
-              this.plugin.settings.syncIntervalMinutes = parsed;
-              await this.plugin.saveSettings();
-            }
-          })
-      );
-
-    new Setting(card)
-      .setName("首次同步冲突处理")
-      .setDesc(
-        "手机里已有旧副本（比如坚果云留下的）时，两边同名但内容不同会按这里处理：默认逐条询问；也可以一次性「以电脑为准」覆盖手机，或反过来。"
-      )
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOptions({
-            conflict: "逐条询问（最安全）",
-            "prefer-remote": "以电脑为准（覆盖本机同名文件）",
-            "prefer-local": "以本机为准（覆盖电脑同名文件）",
-          })
-          .setValue(this.plugin.settings.firstSyncStrategy)
-          .onChange(async (value) => {
-            this.plugin.settings.firstSyncStrategy = value as
-              | "conflict"
-              | "prefer-remote"
-              | "prefer-local";
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(card)
-      .setName("同步本插件程序文件")
-      .setDesc(
-        "默认开启：把 main.js / manifest.json / styles.css 一起同步，电脑上更新插件后手机自动跟上（拉取后需重启 Obsidian 生效）。data.<设备>.json（配对码）、基线、缓存、临时文件永远不同步。"
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.syncSelfCode).onChange(async (value) => {
-          this.plugin.settings.syncSelfCode = value;
-          await this.plugin.saveSettings();
-        })
-      );
-
-    new Setting(card)
-      .setName("同步第三方插件设置（危险）")
-      .setDesc(
-        "默认关闭。开启后会把各插件的 data.json 一并同步，而其中可能含坚果云、GitHub 等第三方服务的密码/令牌，局域网明文传输有泄露风险。"
-      )
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.syncPluginData).onChange(async (value) => {
-          this.plugin.settings.syncPluginData = value;
-          await this.plugin.saveSettings();
-        })
-      );
+          },
+        },
+        { text: "完整自检", cta: true, onClick: () => this.plugin.runSelfTest() },
+      ],
+      "「完整自检」依次测：requestUrl、fetch、1MB/8MB 分块下载、写盘、2MB 上传。"
+    );
   }
 
+  // ---------- 运行日志 ----------
+
   private renderLogSection(parent: HTMLElement): void {
-    const card = parent.createDiv({ cls: "lan-sync-card" });
-    card.createEl("h3", { text: "运行日志" });
-    card.createEl("p", {
-      cls: "lan-sync-muted",
-      text: "同步结果、自检报告与错误原因都在这里。完整报告超出下面的显示范围时，用「复制日志」取全文。",
-    });
+    const card = this.card(parent, "运行日志", "同步结果、自检报告与错误原因都在这里；超出显示范围时用「复制」取全文。");
     this.logEl = card.createEl("pre", { cls: "lan-sync-log" });
     this.refreshLog();
-    new Setting(card)
-      .setName("复制日志")
-      .setDesc("复制最近 200 行到剪贴板，便于反馈问题。")
-      .addButton((btn) =>
-        btn.setButtonText("复制").onClick(async () => {
+
+    this.buttons(card, "复制日志", [
+      {
+        text: "复制",
+        onClick: async () => {
           const text = this.plugin.logs.slice(-200).join("\n");
           if (!text) {
             new Notice("暂无日志");
@@ -617,16 +481,13 @@ export class LanSyncSettingTab extends PluginSettingTab {
           } catch {
             new Notice("复制失败，请长按日志手动选择复制");
           }
-        })
-      );
-    new Setting(card)
-      .setName("临时文件")
-      .setDesc("自检会在 .obsidian/plugins/lan-sync/tmp 下写测试文件，可随时清理。")
-      .addButton((btn) =>
-        btn.setButtonText("清理").onClick(async () => {
-          await this.plugin.cleanTempFiles();
-        })
-      );
+        },
+      },
+    ], "复制最近 200 行到剪贴板，便于反馈问题。");
+
+    this.buttons(card, "临时文件", [
+      { text: "清理", onClick: () => this.plugin.cleanTempFiles() },
+    ], "自检会在 .obsidian/plugins/lan-sync/tmp 下写测试文件，可随时清理。");
   }
 
   refreshLog(): void {
