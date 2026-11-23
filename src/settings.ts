@@ -45,8 +45,8 @@ export interface LanSyncSettings {
   webdavHttps: boolean;
   webdavUser: string;
   webdavPassword: string;
-  /** WebDAV 下用作同步根的子目录；留空 = lansync/<库名> */
-  webdavRoot: string;
+  /** WebDAV 下同步根的「路径前缀」：可自定义命名/层级，留空=直接用库名；库名固定不可改 */
+  webdavPathPrefix: string;
   /** 冲突自动「留两份、本机优先」；关闭则弹三选一复核 */
   autoConflictResolve: boolean;
   /** 设备唯一标识（锁文件里区分谁在同步） */
@@ -77,7 +77,7 @@ export const DEFAULT_SETTINGS: LanSyncSettings = {
   webdavHttps: false,
   webdavUser: "webdav",
   webdavPassword: "",
-  webdavRoot: "",
+  webdavPathPrefix: "",
   autoConflictResolve: true,
   deviceId: "",
 };
@@ -206,16 +206,21 @@ export class LanSyncSettingTab extends PluginSettingTab {
           });
       });
 
+    const rootPreview = card.createEl("div", {
+      cls: "lan-sync-url",
+      text: `当前同步根：${this.plugin.webdavRoot()}`,
+    });
     new Setting(card)
-      .setName("同步根目录")
-      .setDesc("WebDAV 下的子目录，留空 = lansync/<库名>。用于隔离，避免误删 share 其它文件。")
+      .setName("路径前缀（可选）")
+      .setDesc("可自定义命名/层级（如 aaa/play），留空则直接用库名。库名固定为当前库文件夹名，不可修改。")
       .addText((text) =>
         text
-          .setPlaceholder("lansync/我的库")
-          .setValue(s.webdavRoot)
+          .setPlaceholder("留空 = 直接用库名")
+          .setValue(s.webdavPathPrefix)
           .onChange(async (v) => {
-            s.webdavRoot = v.trim();
+            s.webdavPathPrefix = v;
             await this.plugin.saveSettings();
+            rootPreview.setText(`当前同步根：${this.plugin.webdavRoot()}`);
           })
       );
 

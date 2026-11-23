@@ -34,7 +34,7 @@ export interface WebDavHttp {
 export interface WebDavConfig {
   /** 例：http://127.0.0.1:8080 */
   baseUrl: string;
-  /** 同步根（相对 WebDAV 根），例：lansync/MyVault */
+  /** 同步根（相对 WebDAV 根），例：<路径前缀>/<库名>，前缀可留空 */
   root: string;
   user: string;
   pass: string;

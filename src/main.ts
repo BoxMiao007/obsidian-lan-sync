@@ -260,11 +260,24 @@ export default class LanSyncPlugin extends Plugin {
     return `${proto}://${clean}:${this.settings.webdavPort}`;
   }
 
-  private webdavRoot(): string {
-    const configured = (this.settings.webdavRoot || "").trim();
-    if (configured) return configured.replace(/^\/+|\/+$/g, "");
-    const name = String(this.app.vault.getName?.() || "vault").replace(/[\\/:*?"<>|]/g, "_");
-    return `lansync/${name}`;
+  /** 当前库文件夹名（固定，不可改）：用作 WebDAV 同步根的最后一段。 */
+  webdavVaultName(): string {
+    const name = String(this.app.vault.getName?.() || "vault").trim();
+    return name || "vault";
+  }
+
+  /**
+   * WebDAV 同步根 = `<路径前缀>/<库名>`。
+   * 前缀可自定义命名/层级、可留空；库名固定为当前库文件夹名（如 Obsidian-Vault），不可改。
+   */
+  webdavRoot(): string {
+    const prefix = String(this.settings.webdavPathPrefix || "")
+      .split("/")
+      .map((s) => s.trim())
+      .filter((s) => s && s !== "." && s !== "..")
+      .join("/");
+    const vault = this.webdavVaultName();
+    return prefix ? `${prefix}/${vault}` : vault;
   }
 
   private webdavConfig() {
