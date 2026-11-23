@@ -171,23 +171,37 @@ export default class LanSyncPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    if (!this.settings.token) {
-      this.settings.token = randomPairCode();
-      await this.saveSettings();
+    const adapter: any = this.app.vault.adapter;
+    const path = this.settingsPath();
+    let stored: any = null;
+    try {
+      if (await adapter.exists(path)) {
+        stored = JSON.parse(await adapter.read(path));
+      } else {
+        // 首次升级：从旧的共享 data.json 迁移；迁移后删除旧文件，避免它再被 git 跟踪/覆盖
+        const legacy = await this.loadData();
+        if (legacy && typeof legacy === "object") stored = legacy;
+      }
+    } catch (err) {
+      this.log(`读取设置失败，按默认处理：${errMsg(err)}`);
     }
-    if (!this.settings.clientToken) {
-      this.settings.clientToken = this.settings.token;
-      await this.saveSettings();
-    }
-    if (!this.settings.deviceId) {
-      this.settings.deviceId = randomDeviceId();
-      await this.saveSettings();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, stored || {});
+    if (!this.settings.token) this.settings.token = randomPairCode();
+    if (!this.settings.clientToken) this.settings.clientToken = this.settings.token;
+    if (!this.settings.deviceId) this.settings.deviceId = randomDeviceId();
+    await this.saveSettings();
+    // 迁移完成后删除旧 data.json（若存在）
+    try {
+      const legacyPath = normalizePath(`${this.pluginDir()}/data.json`);
+      if (await adapter.exists(legacyPath)) await adapter.remove(legacyPath);
+    } catch {
+      /* 忽略 */
     }
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    const adapter: any = this.app.vault.adapter;
+    await adapter.write(this.settingsPath(), JSON.stringify(this.settings));
   }
 
   log(line: string): void {
@@ -203,6 +217,16 @@ export default class LanSyncPlugin extends Plugin {
 
   pluginDir(): string {
     return normalizePath(`${this.app.vault.configDir}/plugins/lan-sync`);
+  }
+
+  /** 设备角色：桌面/手机，用于「按设备命名」的设置文件。 */
+  deviceRole(): "desktop" | "mobile" {
+    return Platform.isMobileApp ? "mobile" : "desktop";
+  }
+
+  /** 各设备独立的设置文件：data.<desktop|mobile>.json（不再用共享的 data.json）。 */
+  settingsPath(): string {
+    return normalizePath(`${this.pluginDir()}/data.${this.deviceRole()}.json`);
   }
 
   ignoreConfig(): IgnoreConfig {
