@@ -357,13 +357,17 @@ export class LanSyncSettingTab extends PluginSettingTab {
 
   private renderServerSection(parent: HTMLElement): void {
     const card = this.card(parent, "电脑端 · 服务端");
+    const s = this.plugin.settings;
 
+    // 手机端：这里是「连接电脑（直连兜底）」的配置（服务端本身只在电脑运行）
     if (!Platform.isDesktopApp) {
-      card.createEl("p", { cls: "lan-sync-muted", text: "手机端无 Node，不能监听端口；服务端只在电脑运行。" });
+      card.createEl("p", { cls: "lan-sync-muted", text: "服务端只在电脑运行；这里是手机连接电脑（直连兜底）的配置。" });
+      this.text(card, "电脑 IP", s.clientHost, (v) => (s.clientHost = v.trim()), { desc: "只填 IP / 主机名，不带 http:// 与端口。", placeholder: "192.168.1.5" });
+      this.number(card, "端口", s.clientPort, (v) => (s.clientPort = v), { placeholder: "28900", min: 1024, max: 65535 });
+      this.text(card, "配对码", s.clientToken, (v) => (s.clientToken = v.replace(/\D/g, "").slice(0, 8)), { placeholder: "6 位数字" });
       return;
     }
 
-    const s = this.plugin.settings;
     const running = Boolean(this.plugin.server);
     card.createEl("p", { cls: running ? "lan-sync-ok" : "lan-sync-warn", text: running ? `运行中 · 端口 ${this.plugin.server?.port}` : "未启动（点下方按钮启动）" });
 
@@ -431,15 +435,7 @@ export class LanSyncSettingTab extends PluginSettingTab {
   // ---------- 测试连通 ----------
 
   private renderConnectivitySection(parent: HTMLElement): void {
-    const s = this.plugin.settings;
     const card = this.card(parent, "测试连通", "用现有配置检测 WebDAV 与电脑直连是否可达，无需重复填写。");
-
-    // 手机端才需要“电脑直连”的地址（桌面端直接测本机服务）
-    if (Platform.isMobileApp) {
-      this.text(card, "电脑直连 IP（兜底用）", s.clientHost, (v) => (s.clientHost = v.trim()), { desc: "不用兜底可留空。", placeholder: "192.168.1.5" });
-      this.number(card, "电脑直连端口", s.clientPort, (v) => (s.clientPort = v), { placeholder: "28900", min: 1024, max: 65535 });
-      this.text(card, "配对码", s.clientToken, (v) => (s.clientToken = v.replace(/\D/g, "").slice(0, 8)), { placeholder: "6 位数字" });
-    }
 
     this.buttons(
       card,
