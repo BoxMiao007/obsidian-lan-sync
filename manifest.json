@@ -1,7 +1,7 @@
 {
   "id": "lan-sync",
   "name": "LAN Sync · 局域网同步",
-  "version": "0.7.6",
+  "version": "0.7.7",
   "minAppVersion": "1.5.0",
   "description": "同一 Wi-Fi 下在电脑与手机之间同步库，无需任何云服务。",
   "author": "BoxMiao",

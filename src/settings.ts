@@ -104,19 +104,35 @@ export class LanSyncSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "局域网同步" });
 
     this.renderQuickSyncSection(containerEl);
-    this.renderWebDavSection(containerEl);
     this.renderSyncSection(containerEl);
-    this.renderAutoSyncSection(containerEl);
+    this.renderWebDavSection(containerEl);
     this.renderServerSection(containerEl);
     this.renderConnectivitySection(containerEl);
     this.renderLogSection(containerEl);
   }
 
-  // ---------- 同步（置顶） ----------
+  // ---------- 同步（手动 + 自动） ----------
 
   private renderQuickSyncSection(parent: HTMLElement): void {
+    const s = this.plugin.settings;
     const card = this.card(parent, "同步", undefined, true);
+
     this.buttons(card, "手动同步", [{ text: "立即同步", cta: true, onClick: () => this.plugin.runSync() }], "先预览差异，确认后写入。");
+
+    this.toggle(card, "自动同步总开关", s.syncEnabled, (v) => (s.syncEnabled = v), "关闭后只能手动同步。");
+    this.toggle(card, "打开 app 时自动同步", s.syncOnOpen, (v) => (s.syncOnOpen = v), "打开 Obsidian 后自动拉一次（首次仍会确认）。");
+
+    this.number(card, "文件变更后自动同步（秒）", s.syncDebounceSeconds, (v) => (s.syncDebounceSeconds = v), {
+      desc: "停止编辑多少秒后自动同步；0=关闭。手机仅前台有效。",
+      min: 0,
+      max: 600,
+    });
+
+    this.number(card, "定时同步（分钟）", s.syncIntervalMinutes, (v) => (s.syncIntervalMinutes = v), {
+      desc: "每多少分钟同步一次；0=关闭。",
+      min: 0,
+      max: 1440,
+    });
   }
 
   // ---------- 卡片与构件的公共封装 ----------
@@ -335,28 +351,6 @@ export class LanSyncSettingTab extends PluginSettingTab {
       (v) => (s.syncPluginData = v),
       "会同步各插件 data.json，可能含密码/令牌，局域网明文有泄露风险。"
     );
-  }
-
-  // ---------- 自动同步 ----------
-
-  private renderAutoSyncSection(parent: HTMLElement): void {
-    const s = this.plugin.settings;
-    const card = this.card(parent, "自动同步");
-
-    this.toggle(card, "自动同步总开关", s.syncEnabled, (v) => (s.syncEnabled = v), "关闭后只能手动同步。");
-    this.toggle(card, "打开 app 时自动同步", s.syncOnOpen, (v) => (s.syncOnOpen = v), "打开 Obsidian 后自动拉一次（首次仍会确认）。");
-
-    this.number(card, "文件变更后自动同步（秒）", s.syncDebounceSeconds, (v) => (s.syncDebounceSeconds = v), {
-      desc: "停止编辑多少秒后自动同步；0=关闭。手机仅前台有效。",
-      min: 0,
-      max: 600,
-    });
-
-    this.number(card, "定时同步（分钟）", s.syncIntervalMinutes, (v) => (s.syncIntervalMinutes = v), {
-      desc: "每多少分钟同步一次；0=关闭。",
-      min: 0,
-      max: 1440,
-    });
   }
 
   // ---------- 电脑端 · 服务端 ----------
