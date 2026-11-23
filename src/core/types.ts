@@ -30,6 +30,8 @@ export interface Baseline {
   version: 1;
   updatedAt: number;
   entries: Record<string, BaselineEntry>;
+  /** 该基线对应的远端身份（如 webdav:http://ip:8080/库名 或 http://ip:28900）；变化时自动重置 */
+  remote?: string;
 }
 
 export function emptyBaseline(): Baseline {

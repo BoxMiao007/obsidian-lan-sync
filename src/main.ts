@@ -238,24 +238,43 @@ export default class LanSyncPlugin extends Plugin {
     };
   }
 
+  /** 当前远端的身份标识：远端（WebDAV/电脑直连）变了就要重置基线，避免误判“远端全删”。 */
+  remoteIdentity(): string {
+    if (this.settings.transport !== "server" && this.isWebDavConfigured()) {
+      return `webdav:${this.webdavBase()}/${this.webdavRoot()}`;
+    }
+    try {
+      return `http:${this.resolveTarget().base}`;
+    } catch {
+      return "http:unresolved";
+    }
+  }
+
   async loadBaseline(): Promise<Baseline> {
     const adapter: any = this.app.vault.adapter;
     const path = `${this.pluginDir()}/baseline.json`;
+    const key = this.remoteIdentity();
     try {
-      if (!(await adapter.exists(path))) return emptyBaseline();
+      if (!(await adapter.exists(path))) return { ...emptyBaseline(), remote: key };
       const raw = await adapter.read(path);
       const parsed = JSON.parse(raw);
-      if (parsed && parsed.version === 1 && parsed.entries) return parsed as Baseline;
+      if (parsed && parsed.version === 1 && parsed.entries) {
+        if (parsed.remote !== key) {
+          this.log(`远端标识变化（${parsed.remote || "无"} → ${key}），重置同步基线`);
+          return { ...emptyBaseline(), remote: key };
+        }
+        return parsed as Baseline;
+      }
     } catch (err) {
       this.log(`读取基线失败，按首次同步处理：${errMsg(err)}`);
     }
-    return emptyBaseline();
+    return { ...emptyBaseline(), remote: key };
   }
 
   async saveBaseline(baseline: Baseline): Promise<void> {
     const adapter: any = this.app.vault.adapter;
     const path = `${this.pluginDir()}/baseline.json`;
-    await adapter.write(path, JSON.stringify(baseline));
+    await adapter.write(path, JSON.stringify({ ...baseline, remote: this.remoteIdentity() }));
   }
 
   private maxHashBytes(): number {
@@ -584,6 +603,14 @@ export default class LanSyncPlugin extends Plugin {
         .filter((item) => item.reason.includes("冲突标记"))
         .map((item) => item.path);
       if (!hasWork) {
+        // 没有差异：用「双方一致」的文件重建基线（远端变化重置后尤其重要，避免空基线导致后续误判冲突）
+        const localMap = new Map(local.entries.map((e) => [e.path, e]));
+        const entries: Baseline["entries"] = {};
+        for (const p of plan.unchangedPaths) {
+          const e = localMap.get(p);
+          if (e) entries[p] = { size: e.size, sha256: e.sha256 };
+        }
+        await this.saveBaseline({ version: 1, updatedAt: Date.now(), entries });
         await this.saveSyncCaches();
         this.updateStatusBar("ok");
         if (unsafePaths.length) {
