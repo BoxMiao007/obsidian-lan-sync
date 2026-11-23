@@ -194,7 +194,7 @@ export class LanSyncSettingTab extends PluginSettingTab {
 
     new Setting(card)
       .setName("密码")
-      .setDesc("存本机 data.json（该文件不参与同步）。")
+      .setDesc("存本机 data.<设备>.json（该文件不参与同步）。")
       .addText((text) => {
         text.inputEl.type = "password";
         text
@@ -570,7 +570,7 @@ export class LanSyncSettingTab extends PluginSettingTab {
     new Setting(card)
       .setName("同步本插件程序文件")
       .setDesc(
-        "默认开启：把 main.js / manifest.json / styles.css 一起同步，电脑上更新插件后手机自动跟上（拉取后需重启 Obsidian 生效）。data.json（配对码）、基线、临时文件永远不同步。"
+        "默认开启：把 main.js / manifest.json / styles.css 一起同步，电脑上更新插件后手机自动跟上（拉取后需重启 Obsidian 生效）。data.<设备>.json（配对码）、基线、缓存、临时文件永远不同步。"
       )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.syncSelfCode).onChange(async (value) => {

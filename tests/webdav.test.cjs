@@ -21,6 +21,7 @@ function makeFakeWebDav() {
   const files = new Map(); // "/lansync/TestVault/a.md" -> { data: Buffer, mtime: number }
   const dirs = new Set(); // "/lansync/TestVault"
   const stats = { gets: 0, puts: 0, propfinds: 0, moves: 0, copies: 0 };
+  const hooks = {}; // 一次性钩子：hooks.beforeMove({abs,dest}) 在下一次 MOVE 前触发
 
   const norm = (p) => {
     let s = p;
@@ -118,6 +119,7 @@ function makeFakeWebDav() {
     if (method === "MOVE" || method === "COPY") {
       if (method === "MOVE") stats.moves++; else stats.copies++;
       const dest = norm(h["destination"] || "");
+      if (method === "MOVE" && hooks.beforeMove) { const fn = hooks.beforeMove; hooks.beforeMove = null; fn({ abs, dest }); }
       const overwrite = (h["overwrite"] || "T").toUpperCase();
       const exists = files.has(dest) || dirs.has(dest);
       if (exists && overwrite === "F") {
@@ -137,7 +139,7 @@ function makeFakeWebDav() {
 
   return {
     http: { request },
-    files, dirs, stats, addFile,
+    files, dirs, stats, hooks, addFile,
     read(rel) {
       const f = files.get("/" + ROOT + "/" + rel);
       return f ? f.data : null;
@@ -230,6 +232,37 @@ test("WebDAV：锁文件跨客户端互斥 + 释放后可获取", async () => {
   await a.releaseLock();
   const resB2 = await b.acquireLock(60000);
   assert.equal(resB2.acquired, true, "释放后应能拿到锁");
+  await b.releaseLock();
+});
+
+test("WebDAV：抢锁竞态（MOVE 前被抢先）不覆盖他人锁", async () => {
+  const s = makeFakeWebDav();
+  const b = newClient(s, undefined, "device-B");
+  const lockAbs = "/" + ROOT + "/.lansync/lock.json";
+  // 在 B 的 MOVE 真正执行前，让 A 的未过期锁“突然出现”（模拟 readLock 后、MOVE 前的竞态）
+  s.hooks.beforeMove = () => {
+    s.files.set(lockAbs, {
+      data: Buffer.from(JSON.stringify({ deviceId: "device-A", device: "电脑A", startedAt: Date.now(), expiresAt: Date.now() + 60000 })),
+      mtime: Date.now(),
+    });
+    s.dirs.add("/" + ROOT + "/.lansync");
+  };
+  const res = await b.acquireLock(60000);
+  assert.equal(res.acquired, false, "他人已持锁，B 不应抢到");
+  const lock = JSON.parse(s.files.get(lockAbs).data.toString("utf8"));
+  assert.equal(lock.deviceId, "device-A", "他人锁不应被覆盖（必须用 Overwrite:F）");
+});
+
+test("WebDAV：过期锁可被接管", async () => {
+  const s = makeFakeWebDav();
+  const b = newClient(s, undefined, "device-B");
+  s.addFile(".lansync/lock.json", JSON.stringify({
+    deviceId: "device-A", device: "电脑A", startedAt: Date.now() - 120000, expiresAt: Date.now() - 60000,
+  }));
+  const res = await b.acquireLock(60000);
+  assert.equal(res.acquired, true, "过期锁应可接管");
+  const lock = JSON.parse(s.read(".lansync/lock.json").toString("utf8"));
+  assert.equal(lock.deviceId, "device-B", "接管后锁应属于 B");
   await b.releaseLock();
 });
 

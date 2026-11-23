@@ -49,6 +49,8 @@ export interface WebDavConfig {
   timeoutMs?: number;
   retryBaseMs?: number;
   maxRetries?: number;
+  /** 可选日志回调（失败回退、抢锁等诊断信息） */
+  onLog?: (msg: string) => void;
 }
 
 /** 远端哈希缓存条目：ETag（modtime+size 令牌）+ 上次算出的内容哈希 */
@@ -182,7 +184,8 @@ export class WebDavClient {
       body: PROPFIND_BODY,
     });
     if (resp.status === 401 || resp.status === 403) throw new Error(`WebDAV 认证失败（HTTP ${resp.status}）`);
-    if (resp.status !== 207 && resp.status !== 200) throw new Error(`WebDAV 不可用（HTTP ${resp.status}）`);
+    // 真正的 WebDAV 对 PROPFIND 返回 207 Multi-Status；200 多为普通 HTTP 站点，不能当作 WebDAV。
+    if (resp.status !== 207) throw new Error(`WebDAV 不可用（HTTP ${resp.status}）`);
   }
 
   private async mkcol(relDir: string): Promise<void> {
@@ -373,7 +376,8 @@ export class WebDavClient {
     if (mtimeSec > 0) moveHeaders["X-OC-Mtime"] = String(mtimeSec);
     const moveResp = await this.request("MOVE", this.urlFor(tmpPath), { headers: moveHeaders });
     if (moveResp.status >= 300) {
-      // 某些服务器 MOVE 不支持/失败：退回直接 PUT 覆盖（非原子）
+      // 某些服务器 MOVE 不支持/失败：退回直接 PUT 覆盖（非原子，存在写入中途被读到半截文件的风险）
+      this.cfg.onLog?.(`MOVE 原子替换失败（HTTP ${moveResp.status}），退回非原子直接 PUT：${path}`);
       const direct: Record<string, string> = { "Content-Type": "application/octet-stream" };
       if (mtimeSec > 0) direct["X-OC-Mtime"] = String(mtimeSec);
       const retry = await this.request("PUT", this.urlFor(path), { headers: direct, body: data });
@@ -436,9 +440,16 @@ export class WebDavClient {
     }
   }
 
-  /** 尝试获取锁；返回是否成功，以及当前持有者。 */
+  /**
+   * 尝试获取锁；返回是否成功，以及当前持有者。
+   *
+   * 用 `MOVE Overwrite:F` 原子抢锁：目标已存在则服务器回 412，绝不覆盖。这样即便
+   * readLock 之后、MOVE 之前被别的设备抢到锁，也不会把它悄悄覆盖掉（旧实现回退成
+   * Overwrite:T，会清掉对方的锁，导致两设备同时写）。过期锁则允许用 Overwrite:T 接管。
+   */
   async acquireLock(ttlMs: number): Promise<{ acquired: boolean; holder?: { device: string; expiresAt: number } }> {
     const now = Date.now();
+    // 快路径：已有未过期的他人锁，直接判定失败（不去打扰对方）
     const existing = await this.readLock();
     if (existing && existing.deviceId !== this.cfg.deviceId && existing.expiresAt > now) {
       return { acquired: false, holder: { device: existing.device, expiresAt: existing.expiresAt } };
@@ -461,17 +472,30 @@ export class WebDavClient {
     if (put.status < 200 || put.status >= 300) {
       return { acquired: false, holder: existing ? { device: existing.device, expiresAt: existing.expiresAt } : undefined };
     }
-    // 存在未过期锁不能再抢；否则覆盖（含过期接管）
-    const overwrite = existing && existing.expiresAt > now && existing.deviceId !== this.cfg.deviceId ? "F" : "T";
-    const move = await this.request("MOVE", this.urlFor(tmpPath), {
-      headers: { Destination: this.urlFor(LOCK_PATH), Overwrite: overwrite },
+
+    // 原子抢锁：Overwrite:F（目标已存在则 412，不覆盖）
+    let move = await this.request("MOVE", this.urlFor(tmpPath), {
+      headers: { Destination: this.urlFor(LOCK_PATH), Overwrite: "F" },
     });
     if (move.status === 412 || move.status === 409) {
+      const cur = await this.readLock();
+      const foreignLive = cur && cur.deviceId !== this.cfg.deviceId && cur.expiresAt > Date.now();
+      if (foreignLive) {
+        // 有别的设备正持锁：放弃，绝不覆盖
+        await this.request("DELETE", this.urlFor(tmpPath));
+        return { acquired: false, holder: { device: cur!.device, expiresAt: cur!.expiresAt } };
+      }
+      // 过期锁或自己遗留的锁：允许接管
+      move = await this.request("MOVE", this.urlFor(tmpPath), {
+        headers: { Destination: this.urlFor(LOCK_PATH), Overwrite: "T" },
+      });
+    }
+    if (move.status < 200 || move.status >= 300) {
       await this.request("DELETE", this.urlFor(tmpPath));
       const cur = await this.readLock();
       return { acquired: false, holder: cur ? { device: cur.device, expiresAt: cur.expiresAt } : undefined };
     }
-    // 写后回读校验，降低并发抢锁竞态
+    // 写后回读校验，进一步降低并发抢锁风险
     const cur = await this.readLock();
     if (!cur || cur.deviceId !== this.cfg.deviceId) {
       return { acquired: false, holder: cur ? { device: cur.device, expiresAt: cur.expiresAt } : undefined };

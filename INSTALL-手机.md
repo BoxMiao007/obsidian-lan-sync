@@ -93,7 +93,7 @@ http://192.168.x.x:28900/?token=123456
 `.git`、`.trash`、`workspace.json`、`workspace-mobile.json`、各插件的 `data.json`（含坚果云/GitHub 凭据）。
 
 本插件自己的目录只同步 `main.js` / `manifest.json` / `styles.css`（这样电脑更新插件后手机能自动跟上，拉取后需重启 Obsidian）；
-`data.json`（配对码/WebDAV 密码）、`baseline.json`（同步基线）、`sync-cache.json`（哈希缓存）、`tmp/`（传输中间文件）永不同步。
+`data.<设备>.json`（配对码/WebDAV 密码）、`baseline.json`（同步基线）、`sync-cache.json`（哈希缓存）、`tmp/`（传输中间文件）永不同步。
 
 ## WebDAV 模式（v0.6 推荐，可不开电脑服务）
 

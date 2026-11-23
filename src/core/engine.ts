@@ -209,7 +209,7 @@ export async function applyPushPlan(
         throw new Error("本地文件在扫描后发生变化，请重新同步");
       }
 
-      const uploadId = await (async () => {
+      await (async () => {
         if (typeof remote.putFile === "function") {
           const finished = await remote.putFile(item.path, buffer, sha, item.mtime);
           if (finished.size !== item.size) {
@@ -239,7 +239,6 @@ export async function applyPushPlan(
         }
         throw new Error("远端不支持上传（既无 putFile 也无分块接口）");
       })();
-      void uploadId;
       bytes += item.size;
       appliedUploads.push({ ...item, sha256: sha });
     } catch (err: any) {

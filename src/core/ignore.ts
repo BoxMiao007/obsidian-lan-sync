@@ -19,7 +19,7 @@ export interface IgnoreConfig {
   /**
    * 是否同步本插件的程序文件（main.js / manifest.json / styles.css）。
    * 默认 true：这样电脑上更新插件后，手机能自动跟上，不用每次手动拷。
-   * 注意：本插件的 data.json / baseline.json / tmp/ 永远不同步。
+   * 注意：本插件的 data.<设备>.json / baseline.json / sync-cache.json / tmp/ 永远不同步。
    */
   syncSelfCode?: boolean;
 }

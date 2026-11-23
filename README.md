@@ -2,7 +2,7 @@
 
 同一 Wi-Fi 下在电脑与手机之间同步 Obsidian 库，不经过任何云服务。
 
-## 当前状态：v0.6（WebDAV 优先 + 电脑兜底）
+## 当前状态：v0.7（WebDAV 优先 + 电脑兜底）
 
 - ✅ **WebDAV 中转（推荐）**：电脑与手机两个 Obsidian 插件都连手机上的 rclone WebDAV 同步；电脑无需再当常驻服务器
 - ✅ 电脑端 HTTP 服务（原模式）保留为**兜底**：手机连不上 WebDAV 时直连电脑
@@ -12,14 +12,14 @@
 - ✅ 手机端与电脑端双向同步：内容哈希基线 + 4MB 分块传输 + 原子落盘
 - ✅ 同步入口：侧栏 ⇅ 按钮 + 状态栏 + 命令面板
 - ✅ 忽略规则：`.git` / `.trash` / `workspace*.json` / **第三方插件的 data.json**（默认，含凭据）
-- ✅ 本插件程序文件可随同步自动更新（`data.json`/基线/`tmp` 始终排除）
+- ✅ 本插件程序文件可随同步自动更新（`data.<desktop|mobile>.json`/基线/`sync-cache.json`/`tmp` 始终排除）
   - 注意：更新通道只选一个。用 BRAT 更新就把它关掉，避免两端互相覆盖。
 - ✅ 删除传播（双向）+ 删除熔断（>20 个或 >30% 时中止）
 - ✅ 冲突弹窗：逐条选「留电脑 / 留手机 / 两份都留」
 - ✅ 含未解决冲突标记（`<<<<<<<`，坚果云/git 遗留）的文件自动跳过并提示，不再扩散脏内容
 - ✅ 首次同步强制预览（干跑），覆盖/删除前自动备份到 `.trash/lan-sync-backup-*`
 - ✅ 自动同步开关：总开关 / 打开 app 同步 / 文件变更防抖 / 定时同步
-- ✅ 测试：core 25 项 + webdav 8 项 + server 14 项 + e2e 13 项（共 60）
+- ✅ 测试：core 25 项 + webdav 10 项 + server 14 项 + e2e 13 项（共 62）
 - ✅ 通知：一切结果走右上角提示，不弹中心弹窗；冲突与删除保护例外（必须交互确认）
 - ✅ 覆盖/删除前，本机与电脑端文件都会先备份到 `.trash/lan-sync-backup-*`
 - ⏳ 待做：手机端真机验证
@@ -47,6 +47,7 @@
 
 - **兜底**：主用手机若连不上旧手机 WebDAV，会退回直连电脑 HTTP 服务；因此手机端另需在「客户端 · 网络自检」填电脑 IP（电脑 Obsidian 开着时其服务在）。
 - **传输方式**：`自动`（WebDAV 优先，手机连不上时兜底直连电脑 HTTP 服务）/ `只用 WebDAV` / `只用电脑直连`。
+- **配置按设备分开存**：每台设备的设置各自存本地的 `data.<desktop|mobile>.json`（不再共用 `data.json`）；旧 `data.json` 首次加载会自动迁移并删除。两份文件互不覆盖，放进库 git 备份也不会冲突。
 - 同步读写都在 WebDAV 下的子目录里，`.lansync/lock.json` 是跨设备锁，**不参与同步**；不会误碰 share 里其它文件。
 - 想用手动复核冲突：把「冲突自动留两份」关掉，就会弹「留电脑/留手机/两份都留」。
 
@@ -73,14 +74,15 @@
 - 手机端 Obsidian 切到后台会被冻结，自动同步只在 app 前台时可靠。
 - 电脑端 Obsidian 必须开着，服务才在（兜底模式）；WebDAV 模式下电脑只是客户端。
 - **WebDAV 模式**：手机 rclone 默认不支持分段 PUT，手机上传仍受整包内存限制（约 32MB 上限）；超大文件（>24MB）只按大小比较。
-- **WebDAV 明文 Basic**：仅限可信 LAN；密码存本机 `data.json`（该文件不参与同步）。
+- **WebDAV 明文 Basic**：仅限可信 LAN；密码存本机 `data.<设备>.json`（该文件不参与同步）。
+- **非原子回退**：个别 WebDAV 服务器不支持 `MOVE` 时，上传会退回普通 `PUT` 覆盖（非原子，写入中途可能被读到半截文件），日志会给出提示；rclone 支持 `MOVE`，正常不触发。
 - 明文 HTTP 是安卓当前的过渡特性，未来 Obsidian 若收紧，需要切自签 HTTPS（协议层已隔离，只改 `src/net/remote.ts`）。
 
 ## 安全边界
 
 - 只监听局域网，配对码错误一律 401；请求体带 `x-lan-sync-token`。
 - **明文 HTTP**：同 Wi-Fi 下可被抓包。因此默认**不同步**任何第三方插件的 `data.json`——本库的坚果云 WebDAV 凭据、obsidian-git 的 GitHub 令牌都在里面。设置里那个「同步第三方插件设置（危险）」开关默认关闭。
-- `.git`、`.trash`、`workspace*.json`、`*.askpass.sh` 和本插件自身目录永不同步。
+- `.git`、`.trash`、`workspace*.json`、`*.askpass.sh` 永不同步；本插件自身的凭据（`data.<设备>.json`）、基线、缓存也永不同步（仅 `main.js`/`manifest.json`/`styles.css` 可随同步更新）。
 - 同一时刻只允许一个客户端同步（服务端会话锁，1 小时超时兜底）。
 
 ## 开发
@@ -88,7 +90,7 @@
 ```bash
 pnpm install
 pnpm build        # 产出 main.js
-pnpm test         # core + webdav + server + e2e 共 60 项
+pnpm test         # core + webdav + server + e2e 共 62 项
 pnpm serve        # 单独启动服务端（诊断手机浏览器 vs Obsidian）
 ```
 
@@ -115,7 +117,7 @@ tests/             core / server / e2e
 ## 同步语义
 
 - 判据：**内容哈希**。mtime 只做展示与缓存失效，坚果云/git 改写时间戳不会产生假变更。
-- 基线：`<插件目录>/baseline.json`，记录上次成功同步后的共同状态（不参与同步）。
+- 基线：`<插件目录>/baseline.json`，记录上次成功同步后的共同状态（不参与同步）；并记录**远端标识**，换远端（如从旧服务器换到 WebDAV）时自动重置并重建基线，避免旧基线把远端当成“全部被删”而误熔断。
 - 哈希缓存：`<插件目录>/sync-cache.json`（本机 mtime+size→sha、WebDAV ETag→sha），命中即复用，未变不重读/不下载。
 - 冲突（v0.6）：
   - 一端删除、另一端改过 → **编辑优先**，重建被删的一侧（不丢改动）。

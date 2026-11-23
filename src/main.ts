@@ -335,6 +335,7 @@ export default class LanSyncPlugin extends Plugin {
       chunkBytes: this.chunkBytes(),
       maxHashBytes: this.maxHashBytes(),
       timeoutMs: 30000,
+      onLog: (m: string) => this.log(m),
     };
   }
 
@@ -356,6 +357,10 @@ export default class LanSyncPlugin extends Plugin {
         }
         throw new Error(`WebDAV 不可用，且没有可用的电脑兜底：${errMsg(err)}`);
       }
+    }
+    // 桌面端 WebDAV 未配置时不再静默退回 HTTP：电脑端应始终走 WebDAV
+    if (wantWebdav && !Platform.isMobileApp) {
+      throw new Error("电脑端未配置 WebDAV 服务器，请在「设置 → WebDAV 中转」填写后再同步。");
     }
     const target = this.resolveTarget();
     return { remote: new HttpRemote(target.base, target.token, this.chunkBytes()), label: "电脑直连" };
