@@ -103,12 +103,20 @@ export class LanSyncSettingTab extends PluginSettingTab {
     containerEl.addClass("lan-sync-settings");
     containerEl.createEl("h2", { text: "局域网同步" });
 
+    this.renderQuickSyncSection(containerEl);
     this.renderWebDavSection(containerEl);
     this.renderSyncSection(containerEl);
     this.renderAutoSyncSection(containerEl);
     this.renderServerSection(containerEl);
     this.renderSelfTestSection(containerEl);
     this.renderLogSection(containerEl);
+  }
+
+  // ---------- 同步（置顶） ----------
+
+  private renderQuickSyncSection(parent: HTMLElement): void {
+    const card = this.card(parent, "同步");
+    this.buttons(card, "手动同步", [{ text: "立即同步", cta: true, onClick: () => this.plugin.runSync() }], "先预览差异，确认后写入。");
   }
 
   // ---------- 卡片与构件的公共封装 ----------
@@ -261,8 +269,6 @@ export class LanSyncSettingTab extends PluginSettingTab {
       (v) => (s.syncMode = v as LanSyncSettings["syncMode"]),
       "pull=只拉取；push=只推送；both=双向（推荐）。"
     );
-
-    this.buttons(card, "立即同步", [{ text: "立即同步", cta: true, onClick: () => this.plugin.runSync() }], "先预览差异，确认后写入。");
 
     this.toggle(card, "冲突自动留两份（本机优先）", s.autoConflictResolve, (v) => (s.autoConflictResolve = v), "两端都改时自动留两份（本机留原名）；关闭则弹窗逐条复核。");
 
