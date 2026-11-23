@@ -248,13 +248,13 @@ export default class LanSyncPlugin extends Plugin {
 
   private isWebDavConfigured(): boolean {
     if (!this.settings.webdavEnabled) return false;
-    // 手机端 host 可留空（走 127.0.0.1，本机就是 WebDAV 宿主）；电脑端必须填手机 IP
-    if (Platform.isDesktopApp && !this.settings.webdavHost.trim()) return false;
-    return true;
+    // WebDAV 服务器通常是与 Obsidian 客户端分开的一台常开设备（如“旧手机”），
+    // 主用手机和电脑两个客户端都要填它的 IP；若 rclone 恰好与本机同机，才显式填 127.0.0.1。
+    return Boolean(this.settings.webdavHost.trim());
   }
 
   private webdavBase(): string {
-    const raw = this.settings.webdavHost.trim() || (Platform.isMobileApp ? "127.0.0.1" : "");
+    const raw = this.settings.webdavHost.trim();
     const clean = raw.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
     const proto = this.settings.webdavHttps ? "https" : "http";
     return `${proto}://${clean}:${this.settings.webdavPort}`;

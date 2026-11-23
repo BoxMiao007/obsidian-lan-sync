@@ -113,9 +113,7 @@ export class LanSyncSettingTab extends PluginSettingTab {
     card.createEl("h3", { text: "WebDAV 中转（手机 rclone，推荐）" });
     card.createEl("p", {
       cls: "lan-sync-muted",
-      text: Platform.isMobileApp
-        ? "手机本身就是 WebDAV 宿主（127.0.0.1:8080），主机留空即可。同步写进 WebDAV 下的子目录，不碰 share 其它文件。"
-        : "电脑端填手机的局域网 IP（端口默认 8080），用户名/密码与手机 WebDAV 一致。优先走 WebDAV，连不上才退回电脑直连。",
+      text: "WebDAV 服务器通常是单独一台常开设备（如旧手机上的 rclone，默认 :8080）。主用手机与电脑这两个 Obsidian 都填写它的 IP；连不上时才由手机端兜底直连电脑。",
     });
 
     const s = this.plugin.settings;
@@ -144,11 +142,11 @@ export class LanSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(card)
-      .setName("手机 IP / 主机")
-      .setDesc("只填 IP 或主机名，不要带 http:// 和端口。手机端可留空（=127.0.0.1）。")
+      .setName("WebDAV 服务器 IP / 主机")
+      .setDesc("填运行 rclone WebDAV 的那台设备（如旧手机）的局域网 IP，只填 IP 或主机名，不带 http:// 和端口。")
       .addText((text) =>
         text
-          .setPlaceholder(Platform.isMobileApp ? "留空即 127.0.0.1" : "192.168.1.5")
+          .setPlaceholder("192.168.1.5")
           .setValue(s.webdavHost)
           .onChange(async (v) => {
             s.webdavHost = v.trim();

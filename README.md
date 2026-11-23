@@ -34,15 +34,18 @@
 
 ## WebDAV 配置（v0.6 推荐）
 
-手机端用 `rclone serve webdav` 把某个目录（如 `/sdcard/aaa/webdav`）以 WebDAV 暴露到 LAN（详见手机侧文档 `docs/WEBDAV.md`）。然后在**两端** Obsidian 的插件设置「WebDAV 中转」里：
+典型拓扑是 **三设备**：`主用手机（Obsidian） ↔ 旧手机（rclone WebDAV，中转） ↔ 电脑（Obsidian）`。旧手机只跑 `rclone serve webdav`（把某目录如 `/sdcard/aaa/webdav` 暴露到 LAN，详见手机侧文档 `docs/WEBDAV.md`），**不装 Obsidian**；两个 Obsidian 客户端都连它的 WebDAV。
 
-| 字段 | 手机端 | 电脑端 |
+在**主用手机**和**电脑**两端 Obsidian 的「WebDAV 中转」里都填：
+
+| 字段 | 主用手机（Obsidian） | 电脑（Obsidian） |
 |---|---|---|
-| 手机 IP / 主机 | 留空（=127.0.0.1） | 手机的局域网 IP |
+| WebDAV 服务器 IP | 旧手机的局域网 IP | 旧手机的局域网 IP |
 | 端口 | 8080 | 8080 |
 | 用户名/密码 | 与 rclone 一致 | 与 rclone 一致 |
 | 同步根目录 | 同一值（留空=`lansync/<库名>`，两端务必一致） | 同左 |
 
+- **兜底**：主用手机若连不上旧手机 WebDAV，会退回直连电脑 HTTP 服务；因此手机端另需在「客户端 · 网络自检」填电脑 IP（电脑 Obsidian 开着时其服务在）。
 - **传输方式**：`自动`（WebDAV 优先，手机连不上时兜底直连电脑 HTTP 服务）/ `只用 WebDAV` / `只用电脑直连`。
 - 同步读写都在 WebDAV 下的子目录里，`.lansync/lock.json` 是跨设备锁，**不参与同步**；不会误碰 share 里其它文件。
 - 想用手动复核冲突：把「冲突自动留两份」关掉，就会弹「留电脑/留手机/两份都留」。
