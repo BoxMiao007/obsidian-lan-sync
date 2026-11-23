@@ -705,9 +705,12 @@ export default class LanSyncPlugin extends Plugin {
         remoteCount: remoteManifest.entries.length,
         firstSync: baseline.updatedAt === 0,
         mode: this.settings.syncMode,
-        onConfirm: async () => {
+        defaultConflictMode: this.settings.autoConflictResolve ? "both" : "ask",
+        onConfirm: async (conflictMode) => {
           const outcome = await this.applySync(plan, remote!, remoteManifest.entries, baseline);
-          await this.finishConflicts(outcome, remote!);
+          if (outcome.conflictItems.length && conflictMode !== "ask") {
+            await this.resolveConflictsWithChoice(outcome, remote!, conflictMode);
+          }
           await this.saveSyncCaches();
           this.presentOutcome(outcome, false);
         },
@@ -772,6 +775,61 @@ export default class LanSyncPlugin extends Plugin {
     }
     await this.saveBaseline(baseline);
     return { resolved, errors };
+  }
+
+  /** 按用户在预览里选择的统一方式处理本次所有冲突（覆盖前仍备份）。 */
+  private async resolveConflictsWithChoice(
+    outcome: SyncOutcome,
+    remote: SyncRemote,
+    choice: "remote" | "local" | "both"
+  ): Promise<void> {
+    const adapter: any = this.app.vault.adapter;
+    let baseline = await this.loadBaseline();
+    const errors: string[] = [];
+    let resolved = 0;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const backupFolder = `.trash/lan-sync-backup-${stamp}`;
+    for (const conflict of outcome.conflictItems) {
+      try {
+        // 会覆盖对端时，先把对端旧版本备份；会覆盖本机时，先备份本机
+        if (choice === "remote" || choice === "both") {
+          await this.backupFiles([conflict.path], backupFolder);
+        }
+        if (choice === "local" || choice === "both") {
+          await remote.backupFiles([conflict.path], backupFolder).catch(() => 0);
+        }
+        const res =
+          choice === "both"
+            ? await applyKeepBothLocalWins(adapter, remote, remote, conflict, baseline, {
+                chunkBytes: this.chunkBytes(),
+                tmpDir: this.tempDir(),
+                makeCopyPath: conflictCopyPath,
+              })
+            : await applyConflictChoice(adapter, remote, remote, conflict, choice, baseline, {
+                chunkBytes: this.chunkBytes(),
+                tmpDir: this.tempDir(),
+                makeCopyPath: conflictCopyPath,
+              });
+        if (res.errors.length) {
+          errors.push(`${conflict.path}：${res.errors.join("；")}`);
+        } else {
+          baseline = res.newBaseline;
+          resolved++;
+        }
+      } catch (err) {
+        errors.push(`${conflict.path}：${errMsg(err)}`);
+      }
+    }
+    await this.saveBaseline(baseline);
+    outcome.resolvedConflicts = resolved;
+    if (errors.length) {
+      outcome.conflictErrors = errors;
+      for (const e of errors) outcome.lines.push(`  ✗ 冲突处理失败：${e}`);
+    }
+    const label = choice === "remote" ? "以电脑为准" : choice === "local" ? "以本机为准" : "两份都留";
+    if (resolved) outcome.lines.push("", `已处理冲突（${label}）：${resolved} 个`);
+    this.log(`处理冲突（${label}）：成功 ${resolved}，失败 ${errors.length}`);
+    outcome.conflictItems = [];
   }
 
   /** 执行同步计划并返回结构化结果；不做任何提示，展示交给 presentOutcome。 */
@@ -1120,22 +1178,27 @@ interface SyncOutcome {
   conflictErrors?: string[];
 }
 
+type ConflictMode = "both" | "remote" | "local" | "ask";
+
 interface SyncPreviewOptions {
   plan: SyncPlan;
   localCount: number;
   remoteCount: number;
   firstSync: boolean;
   mode: "pull" | "push" | "both";
-  onConfirm: () => Promise<void>;
+  defaultConflictMode: ConflictMode;
+  onConfirm: (conflictMode: ConflictMode) => Promise<void>;
 }
 
 class SyncPreviewModal extends Modal {
   private busy = false;
   private options: SyncPreviewOptions;
+  private conflictMode: ConflictMode;
 
   constructor(app: App, options: SyncPreviewOptions) {
     super(app);
     this.options = options;
+    this.conflictMode = options.defaultConflictMode;
   }
 
   onOpen(): void {
@@ -1175,6 +1238,29 @@ class SyncPreviewModal extends Modal {
       { title: "跳过", items: plan.skipped.map((s) => `${s.path}：${s.reason}`), tone: "muted" },
     ]);
 
+    if (plan.conflicts.length) {
+      const box = contentEl.createDiv({ cls: "lan-sync-choice" });
+      box.createEl("div", { cls: "lan-sync-choice-title", text: "冲突处理方式" });
+      const opts: Array<[ConflictMode, string]> = [
+        ["both", "两份都留（本机优先）"],
+        ["remote", "以电脑为准"],
+        ["local", "以本机为准"],
+        ["ask", "逐条选择"],
+      ];
+      const row = box.createDiv({ cls: "lan-sync-choice-options" });
+      for (const [val, label] of opts) {
+        const item = row.createEl("label", { cls: "lan-sync-choice-item" });
+        const radio = item.createEl("input", { type: "radio" });
+        radio.name = "lan-sync-conflict-mode";
+        radio.value = val;
+        radio.checked = this.conflictMode === val;
+        radio.addEventListener("change", () => {
+          if (radio.checked) this.conflictMode = val;
+        });
+        item.createSpan({ text: label });
+      }
+    }
+
     const buttons = contentEl.createDiv({ cls: "lan-sync-modal-buttons" });
     const cancel = buttons.createEl("button", { text: "取消" });
     cancel.addEventListener("click", () => this.close());
@@ -1189,7 +1275,7 @@ class SyncPreviewModal extends Modal {
       // 先关闭预览，再在下一拍执行；否则结果弹窗会和预览叠在一起
       this.close();
       window.setTimeout(() => {
-        void this.options.onConfirm().catch((err) => {
+        void this.options.onConfirm(this.conflictMode).catch((err) => {
           new Notice(`同步失败：${errMsg(err)}`, 8000);
         });
       }, 80);

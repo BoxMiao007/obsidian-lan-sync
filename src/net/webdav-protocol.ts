@@ -325,27 +325,42 @@ export class WebDavClient {
     _timeoutMs?: number
   ): Promise<{ fileSha: string | null; bytes: number }> {
     const chunkBytes = this.cfg.chunkBytes ?? 4 * 1024 * 1024;
-    let offset = 0;
-    while (offset < size) {
-      const len = Math.min(chunkBytes, size - offset);
-      const resp = await this.request("GET", this.urlFor(path), {
-        headers: { Range: `bytes=${offset}-${offset + len - 1}` },
-      });
-      let chunk: ArrayBuffer;
-      if (resp.status === 206) {
-        chunk = resp.arrayBuffer;
-      } else if (resp.status === 200) {
-        // 服务器忽略 Range：仅当要的是整文件时才可接受
-        if (offset !== 0 || len !== size) throw new Error(`服务器不支持 Range（${path}）`);
-        chunk = resp.arrayBuffer;
-      } else {
-        throw new Error(`下载失败 ${path}@${offset}（HTTP ${resp.status}）`);
+    if (size === 0) return { fileSha: null, bytes: 0 };
+
+    const feed = async (whole: ArrayBuffer): Promise<number> => {
+      let off = 0;
+      while (off < size) {
+        const len = Math.min(chunkBytes, size - off);
+        await onChunk({ chunk: whole.slice(off, off + len), offset: off, fileSize: size, fileSha: null });
+        off += len;
       }
-      if (chunk.byteLength !== len) throw new Error(`分块长度不符 ${path}@${offset}：${chunk.byteLength}/${len}`);
-      await onChunk({ chunk, offset, fileSize: size, fileSha: null });
-      offset += len;
+      return off;
+    };
+
+    // 先用第一块探测：正常支持 Range 的服务器返回 206 且长度精确。
+    const firstLen = Math.min(chunkBytes, size);
+    const first = await this.request("GET", this.urlFor(path), { headers: { Range: `bytes=0-${firstLen - 1}` } });
+    if (first.status === 206 && first.arrayBuffer.byteLength === firstLen) {
+      await onChunk({ chunk: first.arrayBuffer, offset: 0, fileSize: size, fileSha: null });
+      let offset = firstLen;
+      while (offset < size) {
+        const len = Math.min(chunkBytes, size - offset);
+        const resp = await this.request("GET", this.urlFor(path), {
+          headers: { Range: `bytes=${offset}-${offset + len - 1}` },
+        });
+        if (resp.status !== 206 && resp.status !== 200) throw new Error(`下载失败 ${path}@${offset}（HTTP ${resp.status}）`);
+        if (resp.arrayBuffer.byteLength !== len) throw new Error(`分块长度不符 ${path}@${offset}：${resp.arrayBuffer.byteLength}/${len}`);
+        await onChunk({ chunk: resp.arrayBuffer, offset, fileSize: size, fileSha: null });
+        offset += len;
+      }
+      return { fileSha: null, bytes: offset };
     }
-    return { fileSha: null, bytes: offset };
+
+    // 回退：Range 被 gzip 等破坏（206 空体）或服务器忽略 Range 时，整取后再按块喂入。
+    // rclone 会对文本响应 gzip，Obsidian requestUrl 对压缩响应的 206 取不到字节，故必须整取。
+    const whole = await this.downloadWhole(path, size, _timeoutMs);
+    const bytes = await feed(whole);
+    return { fileSha: null, bytes };
   }
 
   // ---------- 上传（临时文件 + MOVE 原子替换） ----------

@@ -144,6 +144,31 @@
   margin: 2px 0 8px;
 }
 
+/* 冲突处理方式选择 */
+.lan-sync-choice {
+  margin: 10px 0 4px;
+  padding: 10px 12px;
+  background: var(--background-primary-alt);
+  border-radius: 8px;
+}
+.lan-sync-choice-title {
+  font-weight: 600;
+  font-size: 0.9em;
+  margin-bottom: 8px;
+}
+.lan-sync-choice-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+.lan-sync-choice-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 0.9em;
+}
+
 /* 分组清单 */
 .lan-sync-report-sections {
   max-height: 54vh;
