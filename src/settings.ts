@@ -117,7 +117,7 @@ export class LanSyncSettingTab extends PluginSettingTab {
     const s = this.plugin.settings;
     const card = this.card(parent, "同步", undefined, true);
 
-    this.buttons(card, "手动同步", [{ text: "立即同步", cta: true, onClick: () => this.plugin.runSync() }], "先预览差异，确认后写入。");
+    this.buttons(card, "手动同步", [{ text: "立即同步", cta: true, onClick: () => this.plugin.runSync() }], "无冲突时直接同步（气泡提示）；有冲突或需删除本机文件时先预览确认。");
 
     this.toggle(card, "自动同步总开关", s.syncEnabled, (v) => (s.syncEnabled = v), "关闭后只能手动同步。");
     this.toggle(card, "打开 app 时自动同步", s.syncOnOpen, (v) => (s.syncOnOpen = v), "打开 Obsidian 后自动拉一次（首次仍会确认）。");

@@ -699,6 +699,17 @@ export default class LanSyncPlugin extends Plugin {
         return;
       }
 
+      // 无冲突、非高危（非首次同步、无删除本机、未熔断）时，不弹预览，直接执行并仅气泡提示。
+      // 仅当涉及：冲突（需选处理方式）、删除保护熔断、首次同步、或要删除本机文件时，才弹预览确认。
+      const needPreview =
+        plan.conflicts.length > 0 || Boolean(plan.breaker) || baseline.updatedAt === 0 || plan.deleteLocal.length > 0;
+      if (!needPreview) {
+        const outcome = await this.applySync(plan, remote, remoteManifest.entries, baseline);
+        await this.saveSyncCaches();
+        this.presentOutcome(outcome, false);
+        return;
+      }
+
       new SyncPreviewModal(this.app, {
         plan,
         localCount: local.entries.length,
