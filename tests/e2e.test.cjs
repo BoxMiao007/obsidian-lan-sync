@@ -708,3 +708,40 @@ test("端到端：带冲突标记的远端文件不会被拉到本机", async ()
     await handle.close();
   }
 });
+
+test("拉取下载原地覆盖：不删除目标文件（避免 Obsidian 关闭已打开的标签）", async () => {
+  const files = new Map();
+  const removed = [];
+  const toAB = (b) => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+  const adapter = {
+    async exists(p) { return files.has(p); },
+    async stat(p) { const b = files.get(p); return b ? { type: "file", size: b.length } : null; },
+    async readBinary(p) { return toAB(files.get(p)); },
+    async writeBinary(p, data) { files.set(p, Buffer.from(data)); },
+    async appendBinary(p, data) { files.set(p, Buffer.concat([files.get(p) || Buffer.alloc(0), Buffer.from(data)])); },
+    async remove(p) { removed.push(p); files.delete(p); },
+    async rename(from, to) { files.set(to, files.get(from)); files.delete(from); },
+    async mkdir() {},
+  };
+  const NEW = Buffer.from("NEWDATA3", "utf8"); // 8 bytes
+  const downloader = {
+    async downloadFile(_p, size, onChunk) {
+      await onChunk({ chunk: toAB(NEW), offset: 0, fileSize: size, fileSha: null });
+      return { fileSha: null, bytes: NEW.length };
+    },
+  };
+  files.set("note.md", Buffer.from("OLDDATA3", "utf8")); // 8 bytes，模拟已存在且被打开的文件
+  const plan = {
+    downloads: [{ path: "note.md", size: NEW.length, sha256: null }],
+    uploads: [],
+    deleteLocal: [],
+    deleteRemote: [],
+    conflicts: [],
+    skipped: [],
+    unchanged: 0,
+  };
+  const res = await applyPullPlan(adapter, downloader, plan, emptyBaseline(), { tmpDir: ".tmp", remoteEntries: [] });
+  assert.equal(res.errors.length, 0, JSON.stringify(res.errors));
+  assert.equal(files.get("note.md").toString("utf8"), "NEWDATA3");
+  assert.ok(!removed.includes("note.md"), "目标文件不应被 remove（否则打开的标签会被关闭重开）");
+});

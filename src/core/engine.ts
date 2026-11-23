@@ -112,8 +112,18 @@ export async function applyPullPlan(
       if (!stat || stat.size !== item.size) throw new Error(`临时文件大小异常：${stat?.size}/${item.size}`);
 
       await ensureDir(adapter, dirname(item.path));
-      if (await adapter.exists(item.path)) await adapter.remove(item.path);
-      await adapter.rename(tmpPath, item.path);
+      // 原地写入以保留「正在打开」的笔记：先删除目标再 rename 会让 Obsidian 认为文件被删，
+      // 导致打开的标签被关闭、再出现时像“重新打开”。改为直接覆盖同一路径（触发 modify 而非 delete/create）。
+      // 超大文件仍走 rename 兜底，避免整体读入内存。
+      const INPLACE_MAX = 64 * 1024 * 1024;
+      if (item.size <= INPLACE_MAX) {
+        const buf = await adapter.readBinary(tmpPath);
+        await adapter.writeBinary(item.path, buf);
+        await adapter.remove(tmpPath);
+      } else {
+        if (await adapter.exists(item.path)) await adapter.remove(item.path);
+        await adapter.rename(tmpPath, item.path);
+      }
 
       bytes += received;
       appliedDownloads.push({ ...item, sha256: item.sha256 ?? result.fileSha ?? null });
