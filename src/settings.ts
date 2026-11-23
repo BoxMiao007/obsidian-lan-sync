@@ -1,6 +1,6 @@
 import { App, Notice, Platform, PluginSettingTab, Setting } from "obsidian";
 import type LanSyncPlugin from "./main";
-import { errMsg, pingWithFetch, pingWithRequestUrl } from "./client";
+import { errMsg } from "./client";
 
 export interface LanSyncSettings {
   /** 电脑端监听端口 */
@@ -108,24 +108,50 @@ export class LanSyncSettingTab extends PluginSettingTab {
     this.renderSyncSection(containerEl);
     this.renderAutoSyncSection(containerEl);
     this.renderServerSection(containerEl);
-    this.renderSelfTestSection(containerEl);
+    this.renderConnectivitySection(containerEl);
     this.renderLogSection(containerEl);
   }
 
   // ---------- 同步（置顶） ----------
 
   private renderQuickSyncSection(parent: HTMLElement): void {
-    const card = this.card(parent, "同步");
+    const card = this.card(parent, "同步", undefined, true);
     this.buttons(card, "手动同步", [{ text: "立即同步", cta: true, onClick: () => this.plugin.runSync() }], "先预览差异，确认后写入。");
   }
 
   // ---------- 卡片与构件的公共封装 ----------
 
-  private card(parent: HTMLElement, title: string, intro?: string): HTMLElement {
-    const card = parent.createDiv({ cls: "lan-sync-card" });
-    card.createEl("h3", { text: title });
-    if (intro) card.createEl("p", { cls: "lan-sync-muted", text: intro });
-    return card;
+  private static readonly CARD_STATE_KEY = "lan-sync:card-open";
+
+  /** 折叠卡片：默认折叠，开合状态记在 localStorage（每设备独立）。 */
+  private card(parent: HTMLElement, title: string, intro?: string, defaultOpen = false): HTMLElement {
+    const details = parent.createEl("details", { cls: "lan-sync-card" });
+    const openMap = this.loadCardOpen();
+    details.open = title in openMap ? openMap[title] === true : defaultOpen;
+    const summary = details.createEl("summary", { cls: "lan-sync-card-summary" });
+    summary.createSpan({ cls: "lan-sync-card-title", text: title });
+    details.addEventListener("toggle", () => this.saveCardOpen(title, details.open));
+    const body = details.createDiv({ cls: "lan-sync-card-body" });
+    if (intro) body.createEl("p", { cls: "lan-sync-muted", text: intro });
+    return body;
+  }
+
+  private loadCardOpen(): Record<string, boolean> {
+    try {
+      return JSON.parse(window.localStorage.getItem(LanSyncSettingTab.CARD_STATE_KEY) || "{}");
+    } catch {
+      return {};
+    }
+  }
+
+  private saveCardOpen(title: string, open: boolean): void {
+    try {
+      const map = this.loadCardOpen();
+      map[title] = open;
+      window.localStorage.setItem(LanSyncSettingTab.CARD_STATE_KEY, JSON.stringify(map));
+    } catch {
+      /* ignore */
+    }
   }
 
   private base(parent: HTMLElement, name: string, desc?: string): Setting {
@@ -408,43 +434,28 @@ export class LanSyncSettingTab extends PluginSettingTab {
     ]);
   }
 
-  // ---------- 客户端 · 网络自检 ----------
+  // ---------- 测试连通 ----------
 
-  private renderSelfTestSection(parent: HTMLElement): void {
+  private renderConnectivitySection(parent: HTMLElement): void {
     const s = this.plugin.settings;
-    const card = this.card(
-      parent,
-      "网络自检（电脑直连兜底）",
-      Platform.isDesktopApp ? "可留空测本机，或填局域网 IP 测真实链路。" : "填电脑的 192.168.x.x 地址和配对码，再点「完整自检」。"
-    );
+    const card = this.card(parent, "测试连通", "用现有配置检测 WebDAV 与电脑直连是否可达，无需重复填写。");
 
-    this.text(card, "电脑 IP", s.clientHost, (v) => (s.clientHost = v.trim()), { desc: "只填 IP / 主机名，不要 http:// 与端口。", placeholder: "192.168.1.5" });
-
-    this.number(card, "端口", s.clientPort, (v) => (s.clientPort = v), { placeholder: "28900", min: 1024, max: 65535 });
-
-    this.text(card, "配对码", s.clientToken, (v) => (s.clientToken = v.replace(/\D/g, "").slice(0, 8)), { placeholder: "6 位数字" });
+    // 手机端才需要“电脑直连”的地址（桌面端直接测本机服务）
+    if (Platform.isMobileApp) {
+      this.text(card, "电脑直连 IP（兜底用）", s.clientHost, (v) => (s.clientHost = v.trim()), { desc: "不用兜底可留空。", placeholder: "192.168.1.5" });
+      this.number(card, "电脑直连端口", s.clientPort, (v) => (s.clientPort = v), { placeholder: "28900", min: 1024, max: 65535 });
+      this.text(card, "配对码", s.clientToken, (v) => (s.clientToken = v.replace(/\D/g, "").slice(0, 8)), { placeholder: "6 位数字" });
+    }
 
     this.buttons(
       card,
-      "开始测试",
+      "连通测试",
       [
-        {
-          text: "仅测连通",
-          onClick: async () => {
-            try {
-              const target = this.plugin.resolveTarget();
-              const a = await pingWithRequestUrl(target);
-              const b = await pingWithFetch(target);
-              new Notice(`${a.ok ? "✓" : "✗"} requestUrl（${a.ms}ms）\n${b.ok ? "✓" : "✗"} fetch（${b.ms}ms）`, 8000);
-              this.plugin.log(`连通测试：requestUrl=${a.ok} fetch=${b.ok}`);
-            } catch (err) {
-              new Notice(errMsg(err));
-            }
-          },
-        },
+        { text: "测试 WebDAV", onClick: () => this.plugin.testWebDav() },
+        { text: "测试电脑直连", onClick: () => this.plugin.testComputer() },
         { text: "完整自检", cta: true, onClick: () => this.plugin.runSelfTest() },
       ],
-      "完整自检：requestUrl、fetch、分块下载、写盘、上传。"
+      "完整自检会实际读写 1MB/8MB 数据，较慢。"
     );
   }
 

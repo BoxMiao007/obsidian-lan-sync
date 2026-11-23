@@ -524,6 +524,54 @@ export default class LanSyncPlugin extends Plugin {
     );
   }
 
+  /** 用现有 WebDAV 配置做连通性探测（不依赖任何额外输入）。 */
+  async testWebDav(): Promise<void> {
+    const notice = new Notice("正在测试 WebDAV…", 3000);
+    const started = Date.now();
+    try {
+      if (!this.isWebDavConfigured()) throw new Error("未配置 WebDAV 服务器（填写 IP 后重试）");
+      const wd = createWebDavRemote(this.webdavConfig(), this.remoteHashCache);
+      await (wd as any).probe?.();
+      const ms = Date.now() - started;
+      notice.hide();
+      new Notice(`✓ WebDAV 可达（${ms}ms）\n${this.webdavBase()}/${this.webdavRoot()}`, 8000);
+      this.log(`测试连通 WebDAV：✓ ${ms}ms ${this.webdavBase()}`);
+    } catch (err) {
+      notice.hide();
+      new Notice(`✗ WebDAV 不可达：${errMsg(err)}`, 10000);
+      this.log(`测试连通 WebDAV：✗ ${errMsg(err)}`);
+    }
+  }
+
+  /** 用现有电脑直连配置（桌面端为本机服务）测连通。 */
+  async testComputer(): Promise<void> {
+    const notice = new Notice("正在测试电脑直连…", 3000);
+    let target: Target;
+    try {
+      // 桌面端优先测本机服务（127.0.0.1），避免受 LAN IP 防火墙影响；手机端用已配置的电脑 IP。
+      if (Platform.isDesktopApp && this.server) {
+        target = { base: `http://127.0.0.1:${this.server.port}`, token: this.settings.token };
+      } else {
+        target = this.resolveTarget();
+      }
+    } catch (err) {
+      notice.hide();
+      new Notice(`跳过电脑直连：${errMsg(err)}`, 8000);
+      return;
+    }
+    try {
+      const a = await pingWithRequestUrl(target);
+      const b = await pingWithFetch(target);
+      notice.hide();
+      new Notice(`${a.ok ? "✓" : "✗"} requestUrl（${a.ms}ms）\n${b.ok ? "✓" : "✗"} fetch（${b.ms}ms）\n${target.base}`, 9000);
+      this.log(`测试连通电脑直连：requestUrl=${a.ok} fetch=${b.ok} ${target.base}`);
+    } catch (err) {
+      notice.hide();
+      new Notice(`✗ 电脑直连失败：${errMsg(err)}`, 10000);
+      this.log(`测试连通电脑直连：✗ ${errMsg(err)}`);
+    }
+  }
+
   /** 侧栏/状态栏状态：空闲、同步中、失败。手机端没有状态栏，靠 ribbon 提示。 */
   updateStatusBar(state: "idle" | "syncing" | "ok" | "error" = "idle", detail = ""): void {
     this.syncState = state;
