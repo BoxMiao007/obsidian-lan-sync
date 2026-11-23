@@ -1092,40 +1092,46 @@ class SyncPreviewModal extends Modal {
 
   onOpen(): void {
     const { contentEl } = this;
-    this.setTitle("同步预览（尚未写入任何文件）");
-    contentEl.createEl("p", {
-      text: `本机 ${this.options.localCount} 个文件 · 电脑 ${this.options.remoteCount} 个文件`,
-    });
-    if (this.options.firstSync) {
-      contentEl.createEl("p", {
-        cls: "lan-sync-warn",
-        text: "这是首次同步：请先看完清单再开始，建议先备份手机库。",
-      });
-    }
+    this.setTitle("同步预览");
 
     const plan = this.options.plan;
-    const modeLabel =
-      this.options.mode === "pull" ? "只拉取（电脑→本机）" : this.options.mode === "push" ? "只推送（本机→电脑）" : "双向";
-    const lines: string[] = [`方向：${modeLabel}`, summarizePlan(plan), ""];
-    if (plan.breaker) lines.push(`⛔ ${plan.breaker.message}`, "");
-    appendSection(lines, "将下载 / 覆盖本机", plan.downloads.map((d) => `${d.path}（${formatBytes(d.size)}）`));
-    appendSection(lines, "将上传到电脑", plan.uploads.map((u) => `${u.path}（${formatBytes(u.size)}）`));
-    appendSection(lines, "将删除本机", plan.deleteLocal);
-    appendSection(lines, "将删除电脑上的文件", plan.deleteRemote);
-    appendSection(lines, "冲突（自动留两份 / 复核）", plan.conflicts.map((c) => `${c.path}（${c.reason}）`));
-    appendSection(lines, "跳过", plan.skipped.map((s) => `${s.path}：${s.reason}`));
+    const modeLabel = this.options.mode === "pull" ? "只拉取" : this.options.mode === "push" ? "只推送" : "双向";
 
-    const pre = contentEl.createEl("pre", { cls: "lan-sync-report" });
-    pre.setText(lines.join("\n"));
+    // 顶部：状态徽标 + 计数（数字等宽，长度稳定）
+    const stats = contentEl.createDiv({ cls: "lan-sync-stats" });
+    stats.createSpan({ cls: "lan-sync-badge", text: "尚未写入任何文件" });
+    const stat = (label: string, value: string) => {
+      const el = stats.createDiv({ cls: "lan-sync-stat" });
+      el.createSpan({ cls: "lan-sync-stat-label", text: label });
+      el.createSpan({ cls: "lan-sync-stat-value", text: value });
+    };
+    stat("本机", String(this.options.localCount));
+    stat("电脑", String(this.options.remoteCount));
+    stat("方向", modeLabel);
+
+    contentEl.createEl("p", { cls: "lan-sync-summary-line", text: summarizePlan(plan) });
+
+    if (this.options.firstSync) {
+      contentEl.createEl("p", { cls: "lan-sync-warn", text: "首次同步：请核对清单后再开始，建议先备份手机库。" });
+    }
+    if (plan.breaker) {
+      contentEl.createEl("p", { cls: "lan-sync-danger", text: `⛔ ${plan.breaker.message}` });
+    }
+
+    renderReportSections(contentEl, [
+      { title: "将下载 / 覆盖本机", items: plan.downloads.map((d) => `${d.path}（${formatBytes(d.size)}）`), tone: "download" },
+      { title: "将上传到电脑", items: plan.uploads.map((u) => `${u.path}（${formatBytes(u.size)}）`), tone: "upload" },
+      { title: "将删除本机", items: plan.deleteLocal, tone: "delete" },
+      { title: "将删除电脑文件", items: plan.deleteRemote, tone: "delete" },
+      { title: "冲突（自动留两份 / 复核）", items: plan.conflicts.map((c) => `${c.path}（${conflictReasonLabel(c.reason)}）`), tone: "conflict" },
+      { title: "跳过", items: plan.skipped.map((s) => `${s.path}：${s.reason}`), tone: "muted" },
+    ]);
 
     const buttons = contentEl.createDiv({ cls: "lan-sync-modal-buttons" });
     const cancel = buttons.createEl("button", { text: "取消" });
     cancel.addEventListener("click", () => this.close());
 
-    const confirm = buttons.createEl("button", {
-      text: plan.breaker ? "已中止" : "开始同步",
-      cls: "mod-cta",
-    });
+    const confirm = buttons.createEl("button", { text: plan.breaker ? "已中止" : "开始同步", cls: "mod-cta" });
     if (plan.breaker) confirm.disabled = true;
     confirm.addEventListener("click", () => {
       if (this.busy) return;
@@ -1147,12 +1153,32 @@ class SyncPreviewModal extends Modal {
   }
 }
 
-function appendSection(lines: string[], title: string, items: string[]): void {
-  if (!items.length) return;
-  lines.push(`【${title}】共 ${items.length} 项`);
-  for (const item of items.slice(0, 30)) lines.push(`  ${item}`);
-  if (items.length > 30) lines.push(`  …还有 ${items.length - 30} 项`);
-  lines.push("");
+interface ReportSection {
+  title: string;
+  items: string[];
+  tone?: "download" | "upload" | "delete" | "conflict" | "muted";
+}
+
+/** 把计划/结果渲染成分组列表（替代一坨纯文本 pre，信息不丢）。 */
+function renderReportSections(container: HTMLElement, sections: ReportSection[]): void {
+  const wrap = container.createDiv({ cls: "lan-sync-report-sections" });
+  for (const sec of sections) {
+    if (!sec.items.length) continue;
+    const block = wrap.createDiv({ cls: `lan-sync-report-section is-${sec.tone || "default"}` });
+    const head = block.createDiv({ cls: "lan-sync-report-head" });
+    head.createSpan({ cls: "lan-sync-report-title", text: sec.title });
+    head.createSpan({ cls: "lan-sync-report-count", text: String(sec.items.length) });
+    const ul = block.createEl("ul", { cls: "lan-sync-report-list" });
+    for (const item of sec.items.slice(0, 30)) ul.createEl("li", { text: item });
+    if (sec.items.length > 30) ul.createEl("li", { cls: "lan-sync-report-more", text: `…还有 ${sec.items.length - 30} 项` });
+  }
+}
+
+function conflictReasonLabel(reason: string): string {
+  if (reason === "both-modified") return "两端都改";
+  if (reason === "no-base") return "无共同基线";
+  if (reason === "diverged") return "分叉";
+  return reason;
 }
 
 function conflictCopyPath(path: string): string {
@@ -1186,12 +1212,13 @@ class ConflictModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     this.setTitle("冲突处理");
-    contentEl.createEl("p", {
-      text: `有 ${this.conflicts.length} 个文件两端都改过。逐条选择保留哪个版本：`,
-    });
+    contentEl.createEl("p", { cls: "lan-sync-muted", text: `${this.conflicts.length} 个文件两端都改过，逐条选择保留版本。` });
 
-    const pre = contentEl.createEl("pre", { cls: "lan-sync-report" });
-    pre.setText(this.summary.join("\n"));
+    if (this.summary.length) {
+      const details = contentEl.createEl("details", { cls: "lan-sync-report-details" });
+      details.createEl("summary", { text: "同步概览" });
+      details.createEl("pre", { cls: "lan-sync-report" }).setText(this.summary.join("\n"));
+    }
 
     const options: Array<[string, "remote" | "local" | "both"]> = [
       ["留电脑版本", "remote"],
@@ -1199,9 +1226,12 @@ class ConflictModal extends Modal {
       ["两份都留", "both"],
     ];
 
+    const list = contentEl.createDiv({ cls: "lan-sync-conflict-list" });
     for (const conflict of this.conflicts) {
-      const row = contentEl.createDiv({ cls: "lan-sync-conflict" });
-      row.createEl("div", { cls: "lan-sync-conflict-path", text: conflict.path });
+      const row = list.createDiv({ cls: "lan-sync-conflict" });
+      const head = row.createDiv({ cls: "lan-sync-conflict-head" });
+      head.createEl("div", { cls: "lan-sync-conflict-path", text: conflict.path });
+      head.createEl("div", { cls: "lan-sync-conflict-reason", text: conflictReasonLabel(conflict.reason) });
       const buttons = row.createDiv({ cls: "lan-sync-modal-buttons" });
       for (const [label, choice] of options) {
         const button = buttons.createEl("button", { text: label });
@@ -1223,7 +1253,8 @@ class ConflictModal extends Modal {
       }
     }
 
-    const close = contentEl.createEl("button", { text: "关闭" });
+    const footer = contentEl.createDiv({ cls: "lan-sync-modal-buttons" });
+    const close = footer.createEl("button", { text: "关闭" });
     close.addEventListener("click", () => this.close());
   }
 
