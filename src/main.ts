@@ -713,10 +713,18 @@ export default class LanSyncPlugin extends Plugin {
           this.previewOpen = false;
         },
         onConfirm: async (conflictMode) => {
-          // 用户确认后真正写盘：占用同步锁，避免与自动同步并发
+          // 用户确认后真正写盘：等待期间锁已在 runSync 结束时释放，这里需重新取回锁，避免与其它设备并发
           this.syncRunning = true;
           this.updateStatusBar("syncing");
+          let sessionStarted = false;
           try {
+            try {
+              await remote!.startSession();
+              sessionStarted = true;
+            } catch (e) {
+              new Notice(`获取同步锁失败：${errMsg(e)}`, 8000);
+              return;
+            }
             const outcome = await this.applySync(plan, remote!, remoteManifest.entries, baseline);
             if (outcome.conflictItems.length && conflictMode !== "ask") {
               await this.resolveConflictsWithChoice(outcome, remote!, conflictMode);
@@ -724,6 +732,13 @@ export default class LanSyncPlugin extends Plugin {
             await this.saveSyncCaches();
             this.presentOutcome(outcome, auto);
           } finally {
+            if (sessionStarted) {
+              try {
+                await remote!.endSession();
+              } catch {
+                /* 释放锁失败不阻塞 */
+              }
+            }
             this.syncRunning = false;
             this.lastSyncAt = Date.now();
             if (this.pendingAutoSync) {
