@@ -21,7 +21,7 @@ import { createSyncServer, type SyncServerHandle } from "./server";
 import { DEFAULT_SETTINGS, LanSyncSettingTab, type LanSyncSettings } from "./settings";
 import { buildManifest } from "./core/manifest";
 import type { HashCacheEntry } from "./core/manifest";
-import { planSync, planHasWork, requiresConfirmation, summarizePlan, type SyncPlan, type ConflictItem } from "./core/plan";
+import { planSync, planHasWork, summarizePlan, type SyncPlan, type ConflictItem } from "./core/plan";
 import { emptyBaseline, type Baseline, type FileEntry } from "./core/types";
 import { applyPullPlan, applyPushPlan, applyConflictChoice, applyKeepBothLocalWins } from "./core/engine";
 import { HttpRemote, type SyncRemote } from "./net/remote";
@@ -44,6 +44,8 @@ export default class LanSyncPlugin extends Plugin {
   private autoSyncTimer: number | null = null;
   /** 同步进行中又被触发：结束后补跑一次，避免丢失真实编辑 */
   private pendingAutoSync = false;
+  /** 是否已有「同步预览/冲突处理」弹窗在等待用户操作，避免自动同步重复叠加弹窗 */
+  private previewOpen = false;
   private syncState: "idle" | "syncing" | "ok" | "error" = "idle";
   private ribbonEl: HTMLElement | null = null;
   private statusBarEl: HTMLElement | null = null;
@@ -679,37 +681,27 @@ export default class LanSyncPlugin extends Plugin {
         return;
       }
 
-      // 首次同步 / 触发删除熔断必须确认；冲突在开启「自动留两份」时不再打断
-      let confirm = requiresConfirmation(plan, baseline);
-      if (confirm.required && plan.conflicts.length > 0 && this.settings.autoConflictResolve) {
-        const stillRequired = Boolean(plan.breaker) || baseline.updatedAt === 0;
-        if (!stillRequired) confirm = { required: false, reason: null };
+      // 需要交互/确认：有冲突、删除保护熔断、首次同步、要删除本机文件 → 弹预览（含冲突处理方式）。
+      // 自动同步遇到这些也直接弹窗，而不是仅提示、要求用户再点一次同步。
+      const needPreview =
+        plan.conflicts.length > 0 || Boolean(plan.breaker) || baseline.updatedAt === 0 || plan.deleteLocal.length > 0;
+
+      // 无冲突且非高危：直接执行，气泡提示
+      if (!needPreview) {
+        const outcome = await this.applySync(plan, remote, remoteManifest.entries, baseline);
+        await this.saveSyncCaches();
+        this.presentOutcome(outcome, auto);
+        return;
       }
-      if (auto && confirm.required) {
-        new Notice(`⏸ 已暂停自动同步：${confirm.reason}。请点侧栏 ⇅ 按钮预览并确认后执行。`, 12000);
+
+      // 已有确认弹窗在等待：不重复叠加，记为待跑，关闭后补跑
+      if (this.previewOpen) {
+        if (auto) this.pendingAutoSync = true;
         this.updateStatusBar("idle");
         return;
       }
 
-      if (auto) {
-        const outcome = await this.applySync(plan, remote, remoteManifest.entries, baseline);
-        await this.finishConflicts(outcome, remote);
-        await this.saveSyncCaches();
-        this.presentOutcome(outcome, true);
-        return;
-      }
-
-      // 无冲突、非高危（非首次同步、无删除本机、未熔断）时，不弹预览，直接执行并仅气泡提示。
-      // 仅当涉及：冲突（需选处理方式）、删除保护熔断、首次同步、或要删除本机文件时，才弹预览确认。
-      const needPreview =
-        plan.conflicts.length > 0 || Boolean(plan.breaker) || baseline.updatedAt === 0 || plan.deleteLocal.length > 0;
-      if (!needPreview) {
-        const outcome = await this.applySync(plan, remote, remoteManifest.entries, baseline);
-        await this.saveSyncCaches();
-        this.presentOutcome(outcome, false);
-        return;
-      }
-
+      this.previewOpen = true;
       new SyncPreviewModal(this.app, {
         plan,
         localCount: local.entries.length,
@@ -717,13 +709,28 @@ export default class LanSyncPlugin extends Plugin {
         firstSync: baseline.updatedAt === 0,
         mode: this.settings.syncMode,
         defaultConflictMode: this.settings.autoConflictResolve ? "both" : "ask",
+        onClosed: () => {
+          this.previewOpen = false;
+        },
         onConfirm: async (conflictMode) => {
-          const outcome = await this.applySync(plan, remote!, remoteManifest.entries, baseline);
-          if (outcome.conflictItems.length && conflictMode !== "ask") {
-            await this.resolveConflictsWithChoice(outcome, remote!, conflictMode);
+          // 用户确认后真正写盘：占用同步锁，避免与自动同步并发
+          this.syncRunning = true;
+          this.updateStatusBar("syncing");
+          try {
+            const outcome = await this.applySync(plan, remote!, remoteManifest.entries, baseline);
+            if (outcome.conflictItems.length && conflictMode !== "ask") {
+              await this.resolveConflictsWithChoice(outcome, remote!, conflictMode);
+            }
+            await this.saveSyncCaches();
+            this.presentOutcome(outcome, auto);
+          } finally {
+            this.syncRunning = false;
+            this.lastSyncAt = Date.now();
+            if (this.pendingAutoSync) {
+              this.pendingAutoSync = false;
+              this.scheduleAutoSync(0);
+            }
           }
-          await this.saveSyncCaches();
-          this.presentOutcome(outcome, false);
         },
       }).open();
     } catch (err) {
@@ -1198,6 +1205,7 @@ interface SyncPreviewOptions {
   firstSync: boolean;
   mode: "pull" | "push" | "both";
   defaultConflictMode: ConflictMode;
+  onClosed?: () => void;
   onConfirm: (conflictMode: ConflictMode) => Promise<void>;
 }
 
@@ -1295,6 +1303,7 @@ class SyncPreviewModal extends Modal {
 
   onClose(): void {
     this.contentEl.empty();
+    this.options.onClosed?.();
   }
 }
 

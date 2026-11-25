@@ -312,7 +312,7 @@ export class LanSyncSettingTab extends PluginSettingTab {
       "pull=只拉取；push=只推送；both=双向（推荐）。"
     );
 
-    this.toggle(card, "冲突自动留两份（本机优先）", s.autoConflictResolve, (v) => (s.autoConflictResolve = v), "两端都改时自动留两份（本机留原名）；关闭则弹窗逐条复核。");
+    this.toggle(card, "冲突自动留两份（本机优先）", s.autoConflictResolve, (v) => (s.autoConflictResolve = v), "作为冲突弹窗的默认选项：开＝默认「两份都留」；关＝默认「逐条选择」。冲突总会弹窗让你确认。");
 
     this.dropdown(
       card,
