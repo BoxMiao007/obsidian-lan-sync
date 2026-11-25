@@ -859,7 +859,7 @@ export default class LanSyncPlugin extends Plugin {
       outcome.conflictErrors = errors;
       for (const e of errors) outcome.lines.push(`  ✗ 冲突处理失败：${e}`);
     }
-    const label = choice === "remote" ? "以电脑为准" : choice === "local" ? "以本机为准" : "两份都留";
+    const label = choice === "remote" ? "以 WebDAV 为准" : choice === "local" ? `以${Platform.isDesktopApp ? "电脑" : "手机"}为准` : "两份都留";
     if (resolved) outcome.lines.push("", `已处理冲突（${label}）：${resolved} 个`);
     this.log(`处理冲突（${label}）：成功 ${resolved}，失败 ${errors.length}`);
     outcome.conflictItems = [];
@@ -1274,11 +1274,13 @@ class SyncPreviewModal extends Modal {
 
     if (plan.conflicts.length) {
       const box = contentEl.createDiv({ cls: "lan-sync-choice" });
+      const localName = Platform.isDesktopApp ? "电脑" : "手机";
+      box.createEl("div", { cls: "lan-sync-muted", text: `WebDAV 中转 / 电脑 / 手机：远端＝WebDAV，本机＝${localName}。` });
       box.createEl("div", { cls: "lan-sync-choice-title", text: "冲突处理方式" });
       const opts: Array<[ConflictMode, string]> = [
         ["both", "两份都留（本机优先）"],
-        ["remote", "以电脑为准"],
-        ["local", "以本机为准"],
+        ["remote", "以 WebDAV 版本为准"],
+        ["local", `以本机（${localName}）版本为准`],
         ["ask", "逐条选择"],
       ];
       const row = box.createDiv({ cls: "lan-sync-choice-options" });
@@ -1381,7 +1383,11 @@ class ConflictModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     this.setTitle("冲突处理");
-    contentEl.createEl("p", { cls: "lan-sync-muted", text: `${this.conflicts.length} 个文件两端都改过，逐条选择保留版本。` });
+    const localName = Platform.isDesktopApp ? "电脑" : "手机";
+    contentEl.createEl("p", {
+      cls: "lan-sync-muted",
+      text: `WebDAV 中转 / 电脑 / 手机：远端＝WebDAV，本机＝${localName}。${this.conflicts.length} 个文件两端都改过，逐条选择保留版本。`,
+    });
 
     if (this.summary.length) {
       const details = contentEl.createEl("details", { cls: "lan-sync-report-details" });
@@ -1390,8 +1396,8 @@ class ConflictModal extends Modal {
     }
 
     const options: Array<[string, "remote" | "local" | "both"]> = [
-      ["留电脑版本", "remote"],
-      ["留手机版本", "local"],
+      ["留 WebDAV 版本", "remote"],
+      [`留本机（${localName}）版本`, "local"],
       ["两份都留", "both"],
     ];
 
