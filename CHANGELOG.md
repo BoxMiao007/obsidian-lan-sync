@@ -2,6 +2,12 @@
 
 本插件（LAN Sync · 局域网同步）的版本变更记录。按版本倒序；具体日期以 Git 提交为准。
 
+## [0.8.4]
+
+### 修复
+- **修复「另一台设备正在同步：手机（约 0 分钟后释放）」反复出现、且已拿到锁却被判失败的问题**：根因是 Obsidian 的 `requestUrl`（Electron 网络栈）对同一固定 URL 的 GET 做了启发式缓存（rclone 只返回 ETag/Last-Modified、不返回 Cache-Control），导致锁文件 `.lansync/lock.json` 一直读到旧内容。现在所有 WebDAV GET 请求都带 `Cache-Control: no-cache` 强制回源；文件下载同受影响，也一并修复。
+- 附带修复：该缓存会让锁读取看到「过期很久的旧锁」，`Math.max(0, …)` 把剩余时间夹成 0，于是永远提示「约 0 分钟后释放」。
+
 ## [0.8.3]
 
 ### 变更
